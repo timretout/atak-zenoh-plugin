@@ -70,6 +70,7 @@ buildscript {
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.protobuf")
 }
 apply {
     plugin("atak-takdev-plugin")
@@ -298,6 +299,24 @@ def getCommandFlavor() {
 dependencies {
     implementation fileTree(dir: 'libs', include: '*.jar')
     implementation "org.eclipse.zenoh:zenoh-kotlin-android:1.10.1"
+    // TAK Protocol (protobuf CoT) decoding -- schemas in src/main/proto/,
+    // copied from the SDK's docs/takproto.zip.
+    implementation "com.google.protobuf:protobuf-javalite:4.36.2"
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.36.2"
+    }
+    generateProtoTasks {
+        all().configureEach { task ->
+            task.builtins {
+                java {
+                    option "lite"
+                }
+            }
+        }
+    }
 }
 
 configurations.all {

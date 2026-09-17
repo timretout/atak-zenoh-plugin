@@ -56,7 +56,7 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             String publishTopic = settings.getPublishTopic();
 
             bridge.start(settings.buildConfigJson5(), subscribeTopics, publishTopic,
-                    this::onZenohCotReceived);
+                    this::onZenohSampleReceived);
 
             cotServiceRemote = new CotServiceRemote();
             cotServiceRemote.setCotEventListener(this);
@@ -110,8 +110,34 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         return running;
     }
 
-    /** Called back by {@link ZenohBridge} on a Zenoh-internal thread for every received sample. */
-    private void onZenohCotReceived(final String xml) {
+    /**
+     * Called back by {@link ZenohBridge} on a Zenoh-internal thread for
+     * every received sample. This is a broad, mixed-mesh subscription --
+     * other vendors' non-CoT traffic on the same topics is expected, not an
+     * error, so anything that isn't recognizably CoT XML or TAK Protocol
+     * (protobuf) CoT is dropped quietly rather than logged as a warning.
+     *
+     * Duplicate suppression: none beyond what CoT itself already gives us
+     * for free -- {@link CotMapComponent#getInternalDispatcher()} upserts by
+     * UID, so repeated/duplicate reports of the *same* UID update one
+     * marker rather than piling up. Different vendors reporting the same
+     * real-world entity under independently-chosen UIDs would need
+     * content-level de-duplication, which this doesn't attempt.
+     */
+    private void onZenohSampleReceived(final byte[] payload) {
+        final String xml = decode(payload);
+        if (xml == null) {
+            // TEMPORARY diagnostic for live-traffic investigation -- remove
+            // before shipping; this format-sniffs a mixed-vendor mesh, so
+            // "unrecognized" is the expected common case, not worth a
+            // standing per-message log line.
+            Log.v(TAG, "Unrecognized payload preview: " + previewPayload(payload));
+            return;
+        }
+        // TEMPORARY: unmistakable positive signal for the live-traffic
+        // investigation -- remove alongside the block above.
+        Log.i(TAG, "RECOGNIZED CoT-shaped payload (" + payload.length + "B): " + xml);
+
         final MapView mapView = MapView.getMapView();
         if (mapView == null)
             return;
@@ -121,7 +147,7 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
                 try {
                     CotEvent event = CotEvent.parse(xml);
                     if (event == null || !event.isValid()) {
-                        Log.w(TAG, "Discarding invalid CoT received from Zenoh");
+                        Log.d(TAG, "Discarding unparseable CoT XML from Zenoh");
                         return;
                     }
                     Bundle extra = new Bundle();
@@ -132,6 +158,53 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
                 }
             }
         });
+    }
+
+    /** Recognizes CoT XML and TAK Protocol (protobuf) CoT; anything else -> null. */
+    private static String decode(byte[] payload) {
+        int i = 0;
+        while (i < payload.length && isXmlWhitespace(payload[i]))
+            i++;
+        if (i < payload.length && payload[i] == '<')
+            return new String(payload, java.nio.charset.StandardCharsets.UTF_8);
+        if (TakProtoCotConverter.looksLikeTakProto(payload))
+            return TakProtoCotConverter.decode(payload);
+        return null;
+    }
+
+    private static boolean isXmlWhitespace(byte b) {
+        return b == ' ' || b == '\t' || b == '\r' || b == '\n';
+    }
+
+    /** TEMPORARY: mirrors first-subscriber.py's render_payload() for comparable output. */
+    private static String previewPayload(byte[] payload) {
+        String text;
+        try {
+            java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8
+                    .newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            text = decoder.decode(java.nio.ByteBuffer.wrap(payload)).toString();
+        } catch (Exception e) {
+            text = null;
+        }
+        if (text != null) {
+            boolean printable = true;
+            for (int i = 0; i < text.length() && printable; i++) {
+                char c = text.charAt(i);
+                if (c == '\r' || c == '\n' || c == '\t')
+                    continue;
+                if (Character.isISOControl(c))
+                    printable = false;
+            }
+            if (printable)
+                return "text(" + payload.length + "B): " + text;
+        }
+        int previewLen = Math.min(64, payload.length);
+        StringBuilder hex = new StringBuilder();
+        for (int i = 0; i < previewLen; i++)
+            hex.append(String.format(java.util.Locale.US, "%02x", payload[i]));
+        return "bytes(" + payload.length + "B) hex[:64]=" + hex;
     }
 
     /** {@link CotServiceRemote.CotEventListener} -- taps all CoT traffic flowing through ATAK. */

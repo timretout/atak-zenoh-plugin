@@ -9,12 +9,15 @@ import io.zenoh.pubsub.Publisher
 import io.zenoh.pubsub.Subscriber
 
 /**
- * Java-friendly SAM callback for inbound CoT XML received from the mesh.
- * A plain `fun interface` (rather than Kotlin's `Function1`) so Java call
- * sites can pass a lambda without touching any Kotlin-specific types.
+ * Java-friendly SAM callback for inbound mesh samples. Raw bytes, not a
+ * decoded String: a sample's payload may be TAK Protocol (protobuf), which
+ * isn't valid UTF-8 in general, so any text decoding has to happen only
+ * after the format is known -- see CotBridgeService. A plain `fun interface`
+ * (rather than Kotlin's `Function1`) so Java call sites can pass a lambda
+ * without touching any Kotlin-specific types.
  */
-fun interface ZenohCotListener {
-    fun onCotReceived(xml: String)
+fun interface ZenohSampleListener {
+    fun onSampleReceived(payload: ByteArray)
 }
 
 /**
@@ -45,7 +48,7 @@ class ZenohBridge {
         configJson5: String,
         subscribeTopics: List<String>,
         publishTopic: String?,
-        listener: ZenohCotListener
+        listener: ZenohSampleListener
     ) {
         stop()
         try {
@@ -56,7 +59,7 @@ class ZenohBridge {
             for (topic in subscribeTopics) {
                 val keyExpr: KeyExpr = topic.intoKeyExpr().getOrThrow()
                 val subscriber = newSession.declareSubscriber(keyExpr, callback = { sample ->
-                    listener.onCotReceived(sample.payload.toString())
+                    listener.onSampleReceived(sample.payload.toBytes())
                 }).getOrThrow()
                 subscribers.add(subscriber)
             }
