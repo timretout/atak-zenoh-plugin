@@ -202,6 +202,15 @@ android {
 
         // Extract native libraries from the APK - required for plugin loading
         jniLibs.useLegacyPackaging true
+
+        // app/src/main/jniLibs ships a locally-patched libzenoh_flat_jni.so
+        // (fixes https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49,
+        // an Android-classloader SIGABRT on first CoT delivery -- see
+        // ZenohBridge.kt) that otherwise collides with the unpatched one
+        // pulled in transitively by the org.eclipse.zenoh:zenoh-kotlin-android
+        // dependency. AGP already prefers the app module's copy by default,
+        // this just makes that explicit instead of relying on the default.
+        jniLibs.pickFirsts += ['**/libzenoh_flat_jni.so']
     }
 
     sourceSets {

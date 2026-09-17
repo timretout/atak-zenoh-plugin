@@ -1,0 +1,67 @@
+[package]
+name = "zenoh-flat-jni"
+version = "1.10.1"
+edition = "2021"
+description = "Zenoh JNI bindings and Kotlin wrappers - generated from zenoh-flat via prebindgen"
+license = "EPL-2.0 OR Apache-2.0"
+repository = "https://github.com/eclipse-zenoh/zenoh-flat-jni"
+homepage = "https://zenoh.io"
+
+[features]
+default = ["zenoh-ext"]
+# Gates the hand-written ZBytes serialization JNI (src/zbytes.rs), which needs
+# zenoh-ext's serializer/deserializer.
+zenoh-ext = ["dep:zenoh-ext"]
+
+[dependencies]
+# `unstable` must be on to match the `unstable` zenoh features enabled below:
+# zenoh-flat's `unstable` feature (= `zenoh/unstable`) gates the QoS surface
+# (`Reliability`, `CongestionControl::BlockFirst`, …) in lockstep with the
+# zenoh enum variants, so without it the flat↔native conversions go
+# non-exhaustive once Cargo unifies `zenoh` with `unstable`.
+zenoh-flat = { version = "1.10.1", git = "https://github.com/eclipse-zenoh/zenoh-flat.git", branch = "release/1.10.1", features = ["unstable"] }
+# Runtime home of the JNI binding helpers and the default `JniBindingError`
+# (`::prebindgen_jni_runtime::JniBindingError`) that the generated bindings
+# reference. This is the ~350-line leaf crate — a shipped binding library does
+# not depend on the generator.
+prebindgen-jni-runtime = "0.5"
+# Direct zenoh/zenoh-ext deps for the self-contained ZBytes serialization JNI.
+# Same git rev as zenoh-flat so Cargo unifies the crate instances.
+zenoh = { version = "1.10.1", git = "https://github.com/eclipse-zenoh/zenoh.git", branch = "release/1.10.1", features = ["unstable", "internal", "default"], default-features = false }
+zenoh-ext = { version = "1.10.1", git = "https://github.com/eclipse-zenoh/zenoh.git", branch = "release/1.10.1", features = ["internal"], default-features = false, optional = true }
+jni = "0.21.1"
+konst = "0.3.17"
+tracing = { version = "0.1", features = ["log"] }
+
+[lib]
+name = "zenoh_flat_jni"
+# `cdylib`, not `dylib`: this library is loaded by the JVM, not linked by another
+# Rust crate. cargo-ndk rejects a `dylib` outright ("No usable artifacts produced
+# by cargo"), and on the desktop side cdylib is what a JNI library is meant to be
+# — it exports the extern "C" surface without Rust ABI metadata.
+crate-type = ["staticlib", "cdylib"]
+
+[build-dependencies]
+# Same feature set as the runtime dep so the captured `FEATURES` / cfg-gated
+# `#[prebindgen]` items match what the runtime crate actually compiles.
+zenoh-flat = { version = "1.10.1", git = "https://github.com/eclipse-zenoh/zenoh-flat.git", branch = "release/1.10.1", features = ["unstable"] }
+# The generator, post-#371 split: the JNI/Kotlin adapter plus the decl macros
+# (`convert!`, `fun!`, `expand_*!`, …) it shares with the language-agnostic
+# pipeline.
+prebindgen-jni = "0.5"
+prebindgen-registry = "0.5"
+syn = "2"
+# Post-processes the freshly generated src/generated_bindings.rs to route
+# its `fromParts` factory calls through class_cache::call_from_parts (see
+# patch_class_cache() below and src/class_cache.rs) -- fix for
+# https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49.
+regex = "1"
+
+# panic = "abort" is required on the JNI boundary — a Rust panic crossing
+# into the JVM under unwind is UB.
+[profile.release]
+debug = false
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
