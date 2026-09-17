@@ -22,8 +22,10 @@ public class ZenohPreferenceFragment extends PluginPreferenceFragment {
 
     private static Context staticPluginContext;
 
+    // No leading dot: ImportFileBrowser.accept() compares against
+    // StringUtils.substringAfterLast(filename, "."), which strips it.
     private static final String[] CERT_EXTENSIONS = {
-            ".pem", ".crt", ".cer", ".key", ".der"
+            "pem", "crt", "cer", "key", "der"
     };
 
     /** Conventional per-plugin data location: <atak root>/tools/zenoh/certs */
