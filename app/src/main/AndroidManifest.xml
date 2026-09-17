@@ -2,7 +2,11 @@
     xmlns:tools="http://schemas.android.com/tools"
     tools:ignore="GoogleAppIndexingWarning">
 
-    <application 
+    <!-- required by the org.eclipse.zenoh:zenoh-kotlin-android bindings -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <application
         android:allowBackup="false"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"

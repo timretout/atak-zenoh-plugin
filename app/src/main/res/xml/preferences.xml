@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <com.atakmap.android.gui.PanCheckBoxPreference
+        android:key="zenohEnabled"
+        android:title="Enable Zenoh Bridge"
+        android:summary="Connect to the configured Zenoh router and bridge CoT to/from the mesh"
+        android:defaultValue="false" />
+
+    <PreferenceCategory android:title="Connection" />
+
+    <com.atakmap.android.gui.PanEditTextPreference
+        android:key="zenohRouterEndpoint"
+        android:title="Router Endpoint"
+        android:summary="Zenoh router address, as host:port"
+        android:dialogTitle="Enter the Zenoh router address (host:port)"
+        android:inputType="textNoSuggestions|textUri" />
+
+    <com.atakmap.android.gui.PanCheckBoxPreference
+        android:key="zenohTlsEnabled"
+        android:title="Use TLS"
+        android:summary="Connect using TLS; required for mutual-TLS client auth below"
+        android:defaultValue="false" />
+
+    <com.atakmap.android.gui.PanPreference
+        android:key="zenohCaCertPath"
+        android:title="CA Certificate"
+        android:summary="Certificate used to authenticate the router (tap to browse)" />
+
+    <com.atakmap.android.gui.PanPreference
+        android:key="zenohClientCertPath"
+        android:title="Client Certificate"
+        android:summary="Client certificate for mutual-TLS (tap to browse)" />
+
+    <com.atakmap.android.gui.PanPreference
+        android:key="zenohClientKeyPath"
+        android:title="Client Private Key"
+        android:summary="Client private key for mutual-TLS (tap to browse)" />
+
+    <PreferenceCategory android:title="Topics" />
+
+    <com.atakmap.android.gui.PanEditTextPreference
+        android:key="zenohSubscribeTopics"
+        android:title="Subscribe Topics"
+        android:summary="Zenoh key expressions to subscribe to, one per line. CoT received here is rendered on the map."
+        android:dialogTitle="Enter one key expression per line"
+        android:inputType="textMultiLine|textNoSuggestions" />
+
+    <com.atakmap.android.gui.PanEditTextPreference
+        android:key="zenohPublishTopic"
+        android:title="Publish Topic"
+        android:summary="Zenoh key expression that local CoT traffic is published to"
+        android:dialogTitle="Enter the publish key expression"
+        android:inputType="textNoSuggestions|textUri" />
+
+</PreferenceScreen>

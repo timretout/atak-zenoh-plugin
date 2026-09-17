@@ -69,6 +69,7 @@ buildscript {
 
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
 }
 apply {
     plugin("atak-takdev-plugin")
@@ -114,9 +115,9 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    //kotlinOptions {
-    //    jvmTarget = JavaVersion.VERSION_17
-    //}
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 
     // this is required and should not be removed otherwise the TAK 
     // inner signing check will fail and the plugin will not load
@@ -229,7 +230,8 @@ android {
     }
 
     defaultConfig {
-        minSdkVersion 21
+        // minSdk 30 is required by the org.eclipse.zenoh:zenoh-kotlin-android bindings
+        minSdkVersion 30
         targetSdkVersion 34
 
         def runTasks = gradle.startParameter.taskNames
@@ -286,6 +288,7 @@ def getCommandFlavor() {
 
 dependencies {
     implementation fileTree(dir: 'libs', include: '*.jar')
+    implementation "org.eclipse.zenoh:zenoh-kotlin-android:1.10.1"
 }
 
 configurations.all {
