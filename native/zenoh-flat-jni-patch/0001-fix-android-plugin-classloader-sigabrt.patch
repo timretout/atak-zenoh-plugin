@@ -1,0 +1,628 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8183d10..ccf2a02 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3920,6 +3920,7 @@ dependencies = [
+  "prebindgen-jni",
+  "prebindgen-jni-runtime",
+  "prebindgen-registry",
++ "regex",
+  "syn 2.0.119",
+  "tracing",
+  "zenoh",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7f9f9f7..f6364a3 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,6 +51,11 @@ zenoh-flat = { version = "1.10.1", git = "https://github.com/eclipse-zenoh/zenoh
+ prebindgen-jni = "0.5"
+ prebindgen-registry = "0.5"
+ syn = "2"
++# Post-processes the freshly generated src/generated_bindings.rs to route
++# its `fromParts` factory calls through class_cache::call_from_parts (see
++# patch_class_cache() below and src/class_cache.rs) -- fix for
++# https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49.
++regex = "1"
+ 
+ # panic = "abort" is required on the JNI boundary — a Rust panic crossing
+ # into the JVM under unwind is UB.
+diff --git a/build.rs b/build.rs
+index 310de26..55d3fc8 100644
+--- a/build.rs
++++ b/build.rs
+@@ -61,6 +61,104 @@ fn fail(context: &str, err: impl std::fmt::Display) -> ! {
+     std::process::exit(1);
+ }
+ 
++/// Rewrites each generated `fromParts` factory call site --
++/// `env.call_static_method("io/zenoh/jni/…", "fromParts", DESCR, ARGS)`,
++/// `.and_then(|__v| __v.l())`, `.map_err(…format!("encode struct via
++/// fromParts: {}", e)…)` -- to route through
++/// `class_cache::call_from_parts`, which prefers the class `JNI_OnLoad`
++/// pinned (see `src/class_cache.rs`) over a plain `find_class`. Idempotent:
++/// re-running this against its own output finds nothing to replace, so it's
++/// safe to always call after every `write_rust`, on every build, regardless
++/// of caching.
++///
++/// Fix for <https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49>:
++/// `find_class` from one of Zenoh's own Tokio worker threads (sample/reply
++/// delivery, scouting) resolves through the system classloader, which can't
++/// see APK/plugin classes on Android, and SIGABRTs the process. `JNI_OnLoad`
++/// runs on the thread that calls `System.loadLibrary`, which does have the
++/// application classloader on its stack, so classes pinned there resolve
++/// correctly from any thread afterwards.
++fn patch_class_cache(rust_path: &std::path::Path) {
++    // (class FQN, index constant in src/class_cache.rs) for every
++    // `fromParts` factory the generated encoders call from a thread that
++    // might be one of Zenoh's own.
++    const CLASSES: &[(&str, &str)] = &[
++        ("io/zenoh/jni/pubsub/CacheConfig", "CACHE_CONFIG"),
++        ("io/zenoh/jni/pubsub/EntityGlobalId", "ENTITY_GLOBAL_ID"),
++        ("io/zenoh/jni/pubsub/HistoryConfig", "HISTORY_CONFIG"),
++        ("io/zenoh/jni/pubsub/MissDetectionConfig", "MISS_DETECTION_CONFIG"),
++        ("io/zenoh/jni/pubsub/Miss", "MISS"),
++        ("io/zenoh/jni/pubsub/RecoveryConfig", "RECOVERY_CONFIG"),
++        ("io/zenoh/jni/pubsub/RepliesConfig", "REPLIES_CONFIG"),
++        ("io/zenoh/jni/query/Selector", "SELECTOR"),
++        ("io/zenoh/jni/sample/SourceInfo", "SOURCE_INFO"),
++        ("io/zenoh/jni/time/TimestampInstrumentation", "TIMESTAMP_INSTRUMENTATION"),
++        ("io/zenoh/jni/time/TimestampStackRecord", "TIMESTAMP_STACK_RECORD"),
++        ("io/zenoh/jni/time/Timestamp", "TIMESTAMP"),
++        ("io/zenoh/jni/config/ZenohId", "ZENOH_ID"),
++    ];
++
++    let source = match std::fs::read_to_string(rust_path) {
++        Ok(s) => s,
++        Err(err) => fail("patch_class_cache: read generated_bindings.rs", err),
++    };
++
++    // DOTALL (`(?s)`) so `.` spans the multi-line `&[ … ]` args block; `.*?`
++    // is non-greedy so each match stops at its own call's closing `],`.
++    let pattern = regex::Regex::new(concat!(
++        r#"(?s)env\s*\n\s*\.call_static_method\(\s*\n"#,
++        r#"\s*"(?P<class>io/zenoh/jni/[^"]+)",\s*\n"#,
++        r#"\s*"fromParts",\s*\n"#,
++        r#"\s*"(?P<descr>[^"]+)",\s*\n"#,
++        r#"(?P<args>\s*&\[.*?\],\s*\n)"#,
++        r#"\s*\)\s*\n"#,
++        r#"\s*\.and_then\(\|__v\| __v\.l\(\)\)\s*\n"#,
++        r#"\s*\.map_err\(\|e\| <__JniErr as ::core::convert::From<\s*\n"#,
++        r#"\s*String,\s*\n"#,
++        r#"\s*>>::from\(format!\("encode struct via fromParts: \{\}", e\)\)\)\?;"#,
++    ))
++    .unwrap();
++
++    let mut replaced = std::collections::HashSet::new();
++    let patched = pattern.replace_all(&source, |caps: &regex::Captures| {
++        let class = &caps["class"];
++        let descr = &caps["descr"];
++        let args = &caps["args"];
++        let const_name = CLASSES
++            .iter()
++            .find(|(fqn, _)| *fqn == class)
++            .map(|(_, c)| *c)
++            .unwrap_or_else(|| fail("patch_class_cache", format!("unrecognized fromParts class {class}; add it to CLASSES in build.rs and to class_cache.rs")));
++        replaced.insert(class.to_string());
++        format!(
++            "crate::class_cache::call_from_parts(\n                env,\n                crate::class_cache::{const_name},\n                \"{class}\",\n                \"{descr}\",\n{args}            )\n            .map_err(|e| <__JniErr as ::core::convert::From<\n                String,\n            >>::from(e))?;"
++        )
++    });
++
++    let missing: Vec<&str> = CLASSES
++        .iter()
++        .map(|(fqn, _)| *fqn)
++        .filter(|fqn| !replaced.contains(*fqn))
++        .collect();
++    if !missing.is_empty() {
++        fail(
++            "patch_class_cache",
++            format!(
++                "expected fromParts call sites not found for: {missing:?} \
++                 (upstream codegen output shape changed? update the pattern in build.rs)"
++            ),
++        );
++    }
++
++    if let Err(err) = std::fs::write(rust_path, patched.as_ref()) {
++        fail("patch_class_cache: write generated_bindings.rs", err);
++    }
++    println!(
++        "cargo:warning=class_cache: routed {} fromParts call site(s) through the JNI_OnLoad class cache",
++        replaced.len()
++    );
++}
++
+ /// Namespace-relative member naming: strip the (case-insensitive) class-name
+ /// prefix from a class method's derived name so the flat crate's
+ /// `keyexpr_as_str` surfaces as `asStr` on `KeyExpr`, `zbytes_to_bytes` as
+@@ -818,6 +916,7 @@ fn main() {
+         "cargo:warning=Generated bindings at: {}",
+         rust_path.display()
+     );
++    patch_class_cache(&rust_path);
+ 
+     // ── Kotlin bindings → kotlin/generated/ ─────────────────────────────
+     // The runtime module's Gradle source set picks these up via
+diff --git a/src/class_cache.rs b/src/class_cache.rs
+new file mode 100644
+index 0000000..22c8e36
+--- /dev/null
++++ b/src/class_cache.rs
+@@ -0,0 +1,127 @@
++//! Eagerly resolves and pins the `io.zenoh.jni.*` data-class `fromParts`
++//! factories at library-load time, on the thread that calls
++//! `System.loadLibrary` for this library.
++//!
++//! On Android that thread carries the application/plugin classloader on its
++//! call stack, unlike the native threads Zenoh's own Tokio runtime spawns
++//! internally to deliver samples, replies and scouting results. `FindClass`
++//! from one of *those* threads resolves through the system classloader and
++//! cannot see APK/plugin classes, so any of these `fromParts` factories
++//! resolved lazily -- on first use, from whatever thread that happens to be
++//! -- SIGABRTs the process the first time delivery lands on such a thread.
++//! See <https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49>.
++//!
++//! [`call_from_parts`] is the only entry point call sites need: it uses the
++//! class pinned here when available, and falls back to a plain `find_class`
++//! (the pre-existing behavior) when it isn't -- e.g. on a desktop JVM, or if
++//! `JNI_OnLoad` never got a chance to run.
++
++use std::os::raw::c_void;
++use std::sync::OnceLock;
++
++use jni::{
++    objects::{GlobalRef, JObject, JValue},
++    sys::{jint, JNI_VERSION_1_6},
++    JNIEnv, JavaVM,
++};
++
++// Every `fromParts` factory the generated encoders call to build a `Sample`
++// (or a value reachable from one) for delivery to a Kotlin callback.
++const CLASS_NAMES: &[&str] = &[
++    "io/zenoh/jni/pubsub/CacheConfig",
++    "io/zenoh/jni/pubsub/EntityGlobalId",
++    "io/zenoh/jni/pubsub/HistoryConfig",
++    "io/zenoh/jni/pubsub/MissDetectionConfig",
++    "io/zenoh/jni/pubsub/Miss",
++    "io/zenoh/jni/pubsub/RecoveryConfig",
++    "io/zenoh/jni/pubsub/RepliesConfig",
++    "io/zenoh/jni/query/Selector",
++    "io/zenoh/jni/sample/SourceInfo",
++    "io/zenoh/jni/time/TimestampInstrumentation",
++    "io/zenoh/jni/time/TimestampStackRecord",
++    "io/zenoh/jni/time/Timestamp",
++    "io/zenoh/jni/config/ZenohId",
++];
++
++pub(crate) const CACHE_CONFIG: usize = 0;
++pub(crate) const ENTITY_GLOBAL_ID: usize = 1;
++pub(crate) const HISTORY_CONFIG: usize = 2;
++pub(crate) const MISS_DETECTION_CONFIG: usize = 3;
++pub(crate) const MISS: usize = 4;
++pub(crate) const RECOVERY_CONFIG: usize = 5;
++pub(crate) const REPLIES_CONFIG: usize = 6;
++pub(crate) const SELECTOR: usize = 7;
++pub(crate) const SOURCE_INFO: usize = 8;
++pub(crate) const TIMESTAMP_INSTRUMENTATION: usize = 9;
++pub(crate) const TIMESTAMP_STACK_RECORD: usize = 10;
++pub(crate) const TIMESTAMP: usize = 11;
++pub(crate) const ZENOH_ID: usize = 12;
++
++static CACHE: OnceLock<Vec<Option<GlobalRef>>> = OnceLock::new();
++
++/// Populates [`CACHE`]. Must be called while `env`'s thread still has the
++/// application classloader in its call stack (i.e. from `JNI_OnLoad`).
++/// A class that fails to resolve is left as `None` and logged -- it just
++/// means that one factory keeps the pre-existing (buggy-on-background-
++/// threads) behavior instead of gaining the fix.
++fn populate(env: &mut JNIEnv) -> Vec<Option<GlobalRef>> {
++    CLASS_NAMES
++        .iter()
++        .map(|fqn| match env.find_class(fqn) {
++            Ok(class) => match env.new_global_ref(class) {
++                Ok(global) => Some(global),
++                Err(e) => {
++                    tracing::warn!("class_cache: pin {fqn}: {e}");
++                    None
++                }
++            },
++            Err(e) => {
++                tracing::warn!("class_cache: resolve {fqn}: {e}");
++                None
++            }
++        })
++        .collect()
++}
++
++/// Calls the `fromParts` static factory named by `fqn` (JVM descriptor
++/// `descr`) with `args`, preferring the class pinned by [`JNI_OnLoad`] at
++/// `index` (see the constants above) and falling back to `fqn` itself --
++/// a plain, uncached `find_class` -- if that slot isn't populated.
++pub(crate) fn call_from_parts<'local>(
++    env: &mut JNIEnv<'local>,
++    index: usize,
++    fqn: &str,
++    descr: &str,
++    args: &[JValue],
++) -> Result<JObject<'local>, String> {
++    let cached = CACHE.get().and_then(|c| c[index].as_ref());
++    let result = match cached {
++        Some(class) => env.call_static_method(class, "fromParts", descr, args),
++        None => env.call_static_method(fqn, "fromParts", descr, args),
++    };
++    result
++        .and_then(|v| v.l())
++        .map_err(|e| format!("encode struct via fromParts ({fqn}): {e}"))
++}
++
++/// # Safety
++/// Called by the JVM per the `JNI_OnLoad` contract: `vm` is a valid,
++/// currently-attached `JavaVM*` and this runs before any other native method
++/// in this library is invoked.
++#[no_mangle]
++pub unsafe extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *mut c_void) -> jint {
++    match JavaVM::from_raw(vm) {
++        Ok(jvm) => match jvm.get_env() {
++            Ok(mut env) => {
++                let _ = CACHE.set(populate(&mut env));
++            }
++            Err(e) => {
++                tracing::warn!("class_cache: JNI_OnLoad could not get a JNIEnv: {e}");
++            }
++        },
++        Err(e) => {
++            tracing::warn!("class_cache: JNI_OnLoad could not wrap JavaVM: {e}");
++        }
++    }
++    JNI_VERSION_1_6
++}
+diff --git a/src/generated_bindings.rs b/src/generated_bindings.rs
+index 2f56462..002f319 100644
+--- a/src/generated_bindings.rs
++++ b/src/generated_bindings.rs
+@@ -3841,10 +3841,10 @@ pub(crate) unsafe fn CacheConfig_to_JObject_db89a97c<'a>(
+             env,
+             v.replies_config.is_express.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::CACHE_CONFIG,
+                 "io/zenoh/jni/pubsub/CacheConfig",
+-                "fromParts",
+                 "(JIIZ)Lio/zenoh/jni/pubsub/CacheConfig;",
+                 &[
+                     jni::objects::JValue::from(___max_samples),
+@@ -3853,10 +3853,9 @@ pub(crate) unsafe fn CacheConfig_to_JObject_db89a97c<'a>(
+                     jni::objects::JValue::from(___replies_config_is_express),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -4023,20 +4022,19 @@ pub(crate) unsafe fn EntityGlobalId_to_JObject_42df3b10<'a>(
+             )?
+             .into();
+         let ___eid: jni::sys::jlong = u32_to_jlong_9594a230(env, v.eid.clone())?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::ENTITY_GLOBAL_ID,
+                 "io/zenoh/jni/pubsub/EntityGlobalId",
+-                "fromParts",
+                 "([BJ)Lio/zenoh/jni/pubsub/EntityGlobalId;",
+                 &[
+                     jni::objects::JValue::Object(&___zid_bytes),
+                     jni::objects::JValue::from(___eid),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -4089,10 +4087,10 @@ pub(crate) unsafe fn HistoryConfig_to_JObject_9af92cec<'a>(
+             env,
+             v.max_age.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::HISTORY_CONFIG,
+                 "io/zenoh/jni/pubsub/HistoryConfig",
+-                "fromParts",
+                 "(ZLjava/lang/Long;Ljava/lang/Double;)Lio/zenoh/jni/pubsub/HistoryConfig;",
+                 &[
+                     jni::objects::JValue::from(___detect_late_publishers),
+@@ -4100,10 +4098,9 @@ pub(crate) unsafe fn HistoryConfig_to_JObject_9af92cec<'a>(
+                     jni::objects::JValue::Object(&___max_age),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -7263,20 +7260,19 @@ pub(crate) unsafe fn MissDetectionConfig_to_JObject_5213dfb7<'a>(
+             env,
+             v.sporadic.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::MISS_DETECTION_CONFIG,
+                 "io/zenoh/jni/pubsub/MissDetectionConfig",
+-                "fromParts",
+                 "(JZ)Lio/zenoh/jni/pubsub/MissDetectionConfig;",
+                 &[
+                     jni::objects::JValue::from(___heartbeat),
+                     jni::objects::JValue::from(___sporadic),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -7308,10 +7304,10 @@ pub(crate) unsafe fn Miss_to_JObject_e2758329<'a>(
+             v.source.eid.clone(),
+         )?;
+         let ___nb: jni::sys::jlong = u32_to_jlong_9594a230(env, v.nb.clone())?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::MISS,
+                 "io/zenoh/jni/pubsub/Miss",
+-                "fromParts",
+                 "([BJJ)Lio/zenoh/jni/pubsub/Miss;",
+                 &[
+                     jni::objects::JValue::Object(&___source_zid_bytes),
+@@ -7319,10 +7315,9 @@ pub(crate) unsafe fn Miss_to_JObject_e2758329<'a>(
+                     jni::objects::JValue::from(___nb),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -7865,10 +7860,10 @@ pub(crate) unsafe fn RecoveryConfig_to_JObject_99b77b36<'a>(
+             env,
+             v.retention_period.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::RECOVERY_CONFIG,
+                 "io/zenoh/jni/pubsub/RecoveryConfig",
+-                "fromParts",
+                 "(ZIJJ)Lio/zenoh/jni/pubsub/RecoveryConfig;",
+                 &[
+                     jni::objects::JValue::from(___mode_present),
+@@ -7877,10 +7872,9 @@ pub(crate) unsafe fn RecoveryConfig_to_JObject_99b77b36<'a>(
+                     jni::objects::JValue::from(___retention_period),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -7933,10 +7927,10 @@ pub(crate) unsafe fn RepliesConfig_to_JObject_eb8e9079<'a>(
+             env,
+             v.is_express.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::REPLIES_CONFIG,
+                 "io/zenoh/jni/pubsub/RepliesConfig",
+-                "fromParts",
+                 "(IIZ)Lio/zenoh/jni/pubsub/RepliesConfig;",
+                 &[
+                     jni::objects::JValue::from(___priority),
+@@ -7944,10 +7938,9 @@ pub(crate) unsafe fn RepliesConfig_to_JObject_eb8e9079<'a>(
+                     jni::objects::JValue::from(___is_express),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -8472,20 +8465,19 @@ pub(crate) unsafe fn Selector_to_JObject_60d319dc<'a>(
+                 v.parameters.clone(),
+             )?
+             .into();
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::SELECTOR,
+                 "io/zenoh/jni/query/Selector",
+-                "fromParts",
+                 "(JLjava/lang/String;)Lio/zenoh/jni/query/Selector;",
+                 &[
+                     jni::objects::JValue::from(___key_expr),
+                     jni::objects::JValue::Object(&___parameters),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -8555,10 +8547,10 @@ pub(crate) unsafe fn SourceInfo_to_JObject_355bb3a8<'a>(
+             v.source.eid.clone(),
+         )?;
+         let ___sn: jni::sys::jlong = u32_to_jlong_9594a230(env, v.sn.clone())?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::SOURCE_INFO,
+                 "io/zenoh/jni/sample/SourceInfo",
+-                "fromParts",
+                 "([BJJ)Lio/zenoh/jni/sample/SourceInfo;",
+                 &[
+                     jni::objects::JValue::Object(&___source_zid_bytes),
+@@ -8566,10 +8558,9 @@ pub(crate) unsafe fn SourceInfo_to_JObject_355bb3a8<'a>(
+                     jni::objects::JValue::from(___sn),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -8648,10 +8639,10 @@ pub(crate) unsafe fn TimestampInstrumentation_to_JObject_4986e51d<'a>(
+             env,
+             v.receive.clone(),
+         )?;
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::TIMESTAMP_INSTRUMENTATION,
+                 "io/zenoh/jni/time/TimestampInstrumentation",
+-                "fromParts",
+                 "(ZZZ)Lio/zenoh/jni/time/TimestampInstrumentation;",
+                 &[
+                     jni::objects::JValue::from(___send),
+@@ -8659,10 +8650,9 @@ pub(crate) unsafe fn TimestampInstrumentation_to_JObject_4986e51d<'a>(
+                     jni::objects::JValue::from(___receive),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -8720,10 +8710,10 @@ pub(crate) unsafe fn TimestampStackRecord_to_JObject_9b3e6002<'a>(
+                 ___timestamp_g1 = jni::objects::JObject::null();
+             }
+         }
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::TIMESTAMP_STACK_RECORD,
+                 "io/zenoh/jni/time/TimestampStackRecord",
+-                "fromParts",
+                 "(IIJ[B[B)Lio/zenoh/jni/time/TimestampStackRecord;",
+                 &[
+                     jni::objects::JValue::from(___point),
+@@ -8733,10 +8723,9 @@ pub(crate) unsafe fn TimestampStackRecord_to_JObject_9b3e6002<'a>(
+                     jni::objects::JValue::Object(&___timestamp_g2),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -8802,20 +8791,19 @@ pub(crate) unsafe fn Timestamp_to_JObject_2cba8ec4<'a>(
+                 v.id.clone(),
+             )?
+             .into();
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::TIMESTAMP,
+                 "io/zenoh/jni/time/Timestamp",
+-                "fromParts",
+                 "(J[B)Lio/zenoh/jni/time/Timestamp;",
+                 &[
+                     jni::objects::JValue::from(___ntp64),
+                     jni::objects::JValue::Object(&___id),
+                 ],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+@@ -9045,17 +9033,16 @@ pub(crate) unsafe fn ZenohId_to_JObject_d483690b<'a>(
+                 v.bytes.clone(),
+             )?
+             .into();
+-        let __obj = env
+-            .call_static_method(
++        let __obj = crate::class_cache::call_from_parts(
++                env,
++                crate::class_cache::ZENOH_ID,
+                 "io/zenoh/jni/config/ZenohId",
+-                "fromParts",
+                 "([B)Lio/zenoh/jni/config/ZenohId;",
+                 &[jni::objects::JValue::Object(&___bytes)],
+             )
+-            .and_then(|__v| __v.l())
+             .map_err(|e| <__JniErr as ::core::convert::From<
+                 String,
+-            >>::from(format!("encode struct via fromParts: {}", e)))?;
++            >>::from(e))?;
+         __obj
+     })
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 7b4e048..fbac445 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,6 +18,11 @@
+ mod duration;
+ pub use duration::{duration_from_millis, duration_to_millis};
+ 
++// Fix for https://github.com/eclipse-zenoh/zenoh-flat-jni/issues/49: pins the
++// `io.zenoh.jni.*` `fromParts` factory classes at library-load time so
++// delivery from Zenoh's own background threads doesn't need `FindClass`.
++mod class_cache;
++
+ // Generated by build.rs into src/generated_bindings.rs
+ include!("generated_bindings.rs");
+ 
