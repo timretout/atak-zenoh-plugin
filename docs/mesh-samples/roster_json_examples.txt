@@ -1,0 +1,3 @@
+{"display_name":"archive-vault","format":"json","peer_id":"9c68d50dee1310b9e64e4f7891a582e4","published_at_ms":1789684337408,"role_class":"sink","site":"theater","subscribes":["**"],"synthetic":true,"vendor":"archive-vault"}
+{"display_name":"archive-vault","format":"json","peer_id":"9c68d50dee1310b9e64e4f7891a582e4","published_at_ms":1789684367408,"role_class":"sink","site":"theater","subscribes":["**"],"synthetic":true,"vendor":"archive-vault"}
+{"display_name":"aurochs-charlie","format":"json","peer_id":"55097ac7857ff561033586c1525ea1a","published_at_ms":1789684346239,"publishes":["4ac8d6510a425097c633ca21c3083a30/aurochs/charlie-fob/launched/v1"],"role_class":"effector","site":"charlie-fob","subscribes":["**"],"synthetic":true,"vendor":"aurochs"}
