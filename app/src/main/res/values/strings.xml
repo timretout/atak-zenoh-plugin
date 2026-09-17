@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App -->
+    <string name="app_name">Zenoh</string>
+    <!-- description -->
+    <string name="app_desc">ATAK plugin for connecting to a Zenoh data mesh</string>
+
+
+
+
+</resources>

@@ -1,0 +1,13 @@
+*.iml
+.gradle/
+.idea/
+.takdev/
+local.properties
+build/
+app/build/
+app/build-types/
+.cxx/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
