@@ -9,6 +9,7 @@ import android.preference.Preference;
 import com.atakmap.android.gui.ImportFileBrowserDialog;
 import com.atakmap.android.preference.AtakPreferences;
 import com.atakmap.android.preference.PluginPreferenceFragment;
+import com.atakmap.coremap.filesystem.FileSystemUtils;
 
 import java.io.File;
 
@@ -24,6 +25,12 @@ public class ZenohPreferenceFragment extends PluginPreferenceFragment {
     private static final String[] CERT_EXTENSIONS = {
             ".pem", ".crt", ".cer", ".key", ".der"
     };
+
+    /** Conventional per-plugin data location: <atak root>/tools/zenoh/certs */
+    private static File certsDir() {
+        return new File(FileSystemUtils.getRoot(),
+                "tools" + File.separator + "zenoh" + File.separator + "certs");
+    }
 
     /** Required zero-arg constructor -- only used by the fragment framework after restore. */
     public ZenohPreferenceFragment() {
@@ -58,8 +65,14 @@ public class ZenohPreferenceFragment extends PluginPreferenceFragment {
         pref.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
             @Override
             public boolean onPreferenceClick(Preference preference) {
-                ImportFileBrowserDialog.show(dialogTitle, CERT_EXTENSIONS,
-                        new ImportFileBrowserDialog.DialogDismissed() {
+                new ImportFileBrowserDialog(getActivity())
+                        .setTitle(dialogTitle)
+                        .setExtensionTypes(CERT_EXTENSIONS)
+                        .setStartDirectory(certsDir())
+                        // plain filesystem I/O -- these are ordinary files, not
+                        // anything requiring ATAK's virtual IOProvider layer
+                        .setUseProvider(false)
+                        .setOnDismissListener(new ImportFileBrowserDialog.DialogDismissed() {
                             @Override
                             public void onFileSelected(File file) {
                                 if (file == null)
@@ -72,7 +85,8 @@ public class ZenohPreferenceFragment extends PluginPreferenceFragment {
                             public void onDialogClosed() {
                                 // no-op
                             }
-                        }, getActivity());
+                        })
+                        .show();
                 return true;
             }
         });
