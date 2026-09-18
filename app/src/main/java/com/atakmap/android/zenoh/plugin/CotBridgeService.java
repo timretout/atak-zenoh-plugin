@@ -3,6 +3,8 @@ package com.atakmap.android.zenoh.plugin;
 
 import android.content.Context;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.Toast;
 
 import com.atakmap.android.cot.CotMapComponent;
@@ -19,6 +21,8 @@ import com.atakmap.coremap.log.Log;
 import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Owns the live Zenoh <-> CoT bridge: opens/closes the {@link ZenohBridge}
@@ -42,6 +46,30 @@ import java.util.TimerTask;
  *
  * All start/stop calls are expected from the plugin's map-component
  * lifecycle hooks (onStart/onStop), not from arbitrary threads.
+ *
+ * <p>Auto-reconnect: seen live against a genuinely flaky mesh -- the
+ * router's TCP port stays open while the zenoh session itself intermittently
+ * refuses new connections or goes quiet, and separately Android's Doze mode
+ * can drop {@link CotServiceRemote}'s own connection to ATAK's comms
+ * service. Neither self-heals on its own, so three independent signals each
+ * trigger a full {@link #teardown()} + backoff-scheduled {@link #attemptStart()}:
+ * the initial {@link ZenohBridge#start} call throwing, {@link
+ * CotServiceRemote.ConnectionListener#onCotServiceDisconnected()} firing, and
+ * a publish (including the {@link #SELF_POSITION_INTERVAL_MS} self-position
+ * beacon, which doubles as a session-health canary) throwing. {@link #stop()}
+ * is the only way to actually stop retrying -- while {@link #activeSettings}
+ * is non-null, this keeps trying to recover indefinitely.
+ *
+ * <p>{@link #attemptStart()} always runs on {@link #connectExecutor}, a
+ * dedicated background thread, never inline on the caller's thread and never
+ * via the main-thread {@link #reconnectHandler} directly (that only posts
+ * the hand-off to the executor). Confirmed live why this matters: the very
+ * first version of this retry logic scheduled {@code attemptStart()} itself
+ * via a main-thread {@code Handler}, and {@link ZenohBridge#start} blocks
+ * synchronously on the actual TLS connect -- against a router that was
+ * timing out, that produced a real on-device ANR ("Input dispatching timed
+ * out ... Waited 5005ms for MotionEvent"), and would have repeated it on
+ * every retry for as long as the outage lasted.
  */
 public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
@@ -58,15 +86,30 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
     /** How often the self marker republishes, independent of any share/broadcast action. */
     private static final long SELF_POSITION_INTERVAL_MS = 15_000L;
 
+    /** Reconnect backoff ladder; holds at the last value for a prolonged outage. */
+    private static final long[] RECONNECT_BACKOFF_MS = {2_000L, 5_000L, 15_000L, 30_000L, 60_000L};
+
     private final Context pluginContext;
     private final ZenohBridge bridge = new ZenohBridge();
     private final Timer selfPositionTimer = new Timer("ZenohSelfPosition", true);
+    private final Handler reconnectHandler = new Handler(Looper.getMainLooper());
+    /** Dedicated thread for the (possibly slow/hanging) connect -- see class doc. */
+    private final ExecutorService connectExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ZenohConnect");
+        t.setDaemon(true);
+        return t;
+    });
+    private final Runnable reconnectRunnable = () -> connectExecutor.execute(this::attemptStart);
 
     private CotServiceRemote cotServiceRemote;
     private MapEventDispatcher.MapEventDispatchListener outboundMapEventListener;
     private TimerTask selfPositionTask;
     private boolean running = false;
     private volatile String publishTopicPrefix;
+
+    /** Non-null while the bridge is meant to be up -- start()'s settings, kept for reconnects. */
+    private ZenohSettings activeSettings;
+    private int reconnectAttempt = 0;
 
     public CotBridgeService(Context pluginContext) {
         this.pluginContext = pluginContext;
@@ -80,11 +123,59 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             return;
         }
 
-        try {
-            List<String> subscribeTopics = settings.getSubscribeTopics();
-            publishTopicPrefix = settings.getPublishTopicPrefix();
+        activeSettings = settings;
+        reconnectAttempt = 0;
+        connectExecutor.execute(this::attemptStart);
+    }
 
+    /**
+     * Does the actual connect work {@link #start} used to do inline. Also
+     * the reconnect entry point; always runs on {@link #connectExecutor},
+     * never on the caller's thread (see class doc for why).
+     *
+     * The lock is deliberately released for the actual {@link ZenohBridge#start}
+     * call: it can block for seconds against a slow/hanging router, and
+     * {@link #stop()} (called from the plugin's main-thread lifecycle hooks)
+     * must never be stuck waiting on that. After the call returns (or
+     * throws), {@link #activeSettings} is re-checked under the lock in case
+     * a {@link #stop()} or newer {@link #start} happened while this attempt
+     * was in flight -- if so, this attempt is stale and its bridge session
+     * (if it opened one) is torn down without being wired up.
+     */
+    private void attemptStart() {
+        final ZenohSettings settings;
+        synchronized (this) {
+            settings = activeSettings;
+        }
+        if (settings == null)
+            return;
+
+        List<String> subscribeTopics;
+        String prefix;
+        try {
+            subscribeTopics = settings.getSubscribeTopics();
+            prefix = settings.getPublishTopicPrefix();
             bridge.start(settings.buildConfigJson5(), subscribeTopics, this::onZenohSampleReceived);
+        } catch (final Throwable t) {
+            synchronized (this) {
+                if (activeSettings != settings)
+                    return;
+                Log.e(TAG, "Failed to start Zenoh bridge (attempt " + (reconnectAttempt + 1) + ")", t);
+                teardown();
+                if (reconnectAttempt == 0)
+                    showToast("Zenoh bridge failed to start: " + t.getMessage() + " -- will keep retrying");
+                scheduleReconnect();
+            }
+            return;
+        }
+
+        synchronized (this) {
+            if (activeSettings != settings) {
+                bridge.stop();
+                return;
+            }
+
+            publishTopicPrefix = prefix;
 
             cotServiceRemote = new CotServiceRemote();
             cotServiceRemote.setCotEventListener(this);
@@ -97,6 +188,12 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
                 @Override
                 public void onCotServiceDisconnected() {
                     Log.d(TAG, "CotServiceRemote disconnected");
+                    synchronized (CotBridgeService.this) {
+                        if (activeSettings == null)
+                            return;
+                        teardown();
+                        scheduleReconnect();
+                    }
                 }
             });
 
@@ -121,28 +218,53 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             };
             selfPositionTimer.schedule(selfPositionTask, 0, SELF_POSITION_INTERVAL_MS);
 
+            boolean recovered = reconnectAttempt > 0;
             running = true;
+            reconnectAttempt = 0;
             Log.i(TAG, "Zenoh bridge started: endpoint=" + settings.getRouterEndpoint()
                     + " subscribe=" + subscribeTopics + " publishPrefix=" + publishTopicPrefix);
-        } catch (final Throwable t) {
-            Log.e(TAG, "Failed to start Zenoh bridge", t);
-            stop();
-
-            final MapView mapView = MapView.getMapView();
-            if (mapView != null) {
-                mapView.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        Toast.makeText(pluginContext,
-                                "Zenoh bridge failed to start: " + t.getMessage(),
-                                Toast.LENGTH_LONG).show();
-                    }
-                });
-            }
+            if (recovered)
+                showToast("Zenoh bridge reconnected");
         }
     }
 
+    /** Schedules the next {@link #attemptStart()}, replacing any pending one. No-op once stopped. */
+    private synchronized void scheduleReconnect() {
+        if (activeSettings == null)
+            return;
+        reconnectHandler.removeCallbacks(reconnectRunnable);
+        reconnectHandler.postDelayed(reconnectRunnable, backoffDelayMs(reconnectAttempt));
+        reconnectAttempt++;
+    }
+
+    /** Delay before the Nth (0-indexed) reconnect attempt; holds at the ladder's last rung. */
+    static long backoffDelayMs(int attempt) {
+        int index = Math.max(0, Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1));
+        return RECONNECT_BACKOFF_MS[index];
+    }
+
+    private void showToast(final String message) {
+        final MapView mapView = MapView.getMapView();
+        if (mapView == null)
+            return;
+        mapView.post(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(pluginContext, message, Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    /** Deliberate shutdown: cancels any pending reconnect and stops retrying for good. */
     public synchronized void stop() {
+        reconnectHandler.removeCallbacks(reconnectRunnable);
+        activeSettings = null;
+        reconnectAttempt = 0;
+        teardown();
+    }
+
+    /** The actual resource cleanup, shared by {@link #stop()} and every reconnect path. */
+    private synchronized void teardown() {
         if (cotServiceRemote != null) {
             try {
                 cotServiceRemote.disconnect();
@@ -288,7 +410,14 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         publishCotEvent(event);
     }
 
-    /** Shared by every outbound path: builds the per-entity key and publishes. */
+    /**
+     * Shared by every outbound path: builds the per-entity key and
+     * publishes. A publish failure most likely means the underlying zenoh
+     * session has gone bad (seen live: the router accepts the TCP
+     * connection but the session silently stops working) -- there's no
+     * separate health check, so this doubles as one and triggers the same
+     * teardown+reconnect as a start failure or a CotServiceRemote drop.
+     */
     private void publishCotEvent(CotEvent event) {
         String prefix = publishTopicPrefix;
         if (prefix == null || prefix.isEmpty())
@@ -296,7 +425,13 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         try {
             bridge.publish(buildPublishKey(prefix, event.getUID()), event.toString());
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to publish CoT event to Zenoh", t);
+            Log.e(TAG, "Failed to publish CoT event to Zenoh; scheduling reconnect", t);
+            synchronized (this) {
+                if (activeSettings == null)
+                    return;
+                teardown();
+                scheduleReconnect();
+            }
         }
     }
 
