@@ -189,17 +189,8 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
      */
     private void onZenohSampleReceived(final byte[] payload) {
         final String xml = decode(payload);
-        if (xml == null) {
-            // TEMPORARY diagnostic for live-traffic investigation -- remove
-            // before shipping; this format-sniffs a mixed-vendor mesh, so
-            // "unrecognized" is the expected common case, not worth a
-            // standing per-message log line.
-            Log.v(TAG, "Unrecognized payload preview: " + previewPayload(payload));
+        if (xml == null)
             return;
-        }
-        // TEMPORARY: unmistakable positive signal for the live-traffic
-        // investigation -- remove alongside the block above.
-        Log.i(TAG, "RECOGNIZED CoT-shaped payload (" + payload.length + "B): " + xml);
 
         final MapView mapView = MapView.getMapView();
         if (mapView == null)
@@ -243,37 +234,6 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
     private static boolean isXmlWhitespace(byte b) {
         return b == ' ' || b == '\t' || b == '\r' || b == '\n';
-    }
-
-    /** TEMPORARY: mirrors first-subscriber.py's render_payload() for comparable output. */
-    private static String previewPayload(byte[] payload) {
-        String text;
-        try {
-            java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8
-                    .newDecoder()
-                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
-            text = decoder.decode(java.nio.ByteBuffer.wrap(payload)).toString();
-        } catch (Exception e) {
-            text = null;
-        }
-        if (text != null) {
-            boolean printable = true;
-            for (int i = 0; i < text.length() && printable; i++) {
-                char c = text.charAt(i);
-                if (c == '\r' || c == '\n' || c == '\t')
-                    continue;
-                if (Character.isISOControl(c))
-                    printable = false;
-            }
-            if (printable)
-                return "text(" + payload.length + "B): " + text;
-        }
-        int previewLen = Math.min(64, payload.length);
-        StringBuilder hex = new StringBuilder();
-        for (int i = 0; i < previewLen; i++)
-            hex.append(String.format(java.util.Locale.US, "%02x", payload[i]));
-        return "bytes(" + payload.length + "B) hex[:64]=" + hex;
     }
 
     /**

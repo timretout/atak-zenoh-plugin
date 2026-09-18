@@ -189,6 +189,19 @@ a node named `tak-zenoh-bridge` is apparently receiving it and
 re-publishing a JSON mirror. Worth asking on the portal where that bridge's
 protobuf-side input topic is, rather than concluding the format is unused.
 
+**Update, same day ~11:50 BST -- resolved, real TAK protobuf confirmed.**
+`TakJsonCotConverter` now decodes that `PATCH/tracks/v1` JSON mirror, and
+live traffic includes a genuine hit from a different real person: a
+teammate's actual ATAK-CIV instance (`platform: "ATAK-CIV"`,
+`version: "5.6.0.12 ..."`, callsign "GAM", team Cyan), relayed through
+`tak-zenoh-bridge`. So TAK protobuf is real and in active use on this
+fabric -- the raw `0xbf`-framed wire form (`TakProtoCotConverter`) still
+hasn't been seen directly, but the underlying protocol clearly is flowing;
+`tak-zenoh-bridge` is just decoding it before we ever see the raw bytes.
+The `// TEMPORARY` diagnostic logging in `CotBridgeService.java` can now be
+removed -- both wire-format questions this doc set out to answer are
+settled.
+
 ## Cleanup once this is resolved
 
 `CotBridgeService.java` has two blocks explicitly marked

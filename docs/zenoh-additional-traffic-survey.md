@@ -1,6 +1,14 @@
 # Survey: what else on the mesh could become map data?
 
-**Status: analysis only, no code changes.** Follow-up to
+**2026-09-18 later update: `PATCH/tracks/v1` implemented.** See
+`TakJsonCotConverter` and the "2026-09-18 ~10:06 update" section below --
+this is no longer just a candidate, it's live and verified against real
+traffic (including a real teammate's ATAK-CIV instance). Everything else
+below (`lattice/entity`, `orion.exercise.track.v1`, `iff/track`,
+`consilium/sa-event`, the effector event topics) is still just analysis,
+not implemented.
+
+**Status: analysis only, no code changes, except where noted above.** Follow-up to
 `docs/zenoh-mesh-investigation.md` (which resolved CoT XML/protobuf ingest).
 This mines two captures -- the original 5-minute one
 (`/tmp/mesh_capture.jsonl`, 127,602 samples, 2026-09-18 ~09:29 BST) and a
