@@ -175,10 +175,19 @@ independent producers parses and dispatches correctly, end to end, with the
 plugin's current code.**
 
 TAK protobuf remains the one open item -- still zero genuine `0xbf`-framed
-hits in either capture. Recommend treating `TakProtoCotConverter` as
-verified-by-construction (compiles against the SDK's official schemas,
+hits directly in either capture. Recommend treating `TakProtoCotConverter`
+as verified-by-construction (compiles against the SDK's official schemas,
 reasoned through the wire format) rather than verified-by-traffic, unless a
 vendor confirms on the portal/Slack that they actually publish it.
+
+**Update, same day ~10:06 BST:** a longer follow-up capture (see
+`docs/zenoh-additional-traffic-survey.md`) found `PATCH/tracks/v1/<uid>`
+JSON carrying `"encoding":"tak-protobuf"` and `"source":"tak-zenoh-bridge"`
+-- strong indirect evidence that real TAK-protobuf CoT *does* flow
+somewhere on this fabric, just not on a topic we've subscribed to directly;
+a node named `tak-zenoh-bridge` is apparently receiving it and
+re-publishing a JSON mirror. Worth asking on the portal where that bridge's
+protobuf-side input topic is, rather than concluding the format is unused.
 
 ## Cleanup once this is resolved
 
