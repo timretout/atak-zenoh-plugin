@@ -42,8 +42,9 @@
     <com.atakmap.android.gui.PanEditTextPreference
         android:key="zenohSubscribeTopics"
         android:title="Subscribe Topics"
-        android:summary="Zenoh key expressions to subscribe to, one per line. CoT received here is rendered on the map."
+        android:summary="Zenoh key expressions to subscribe to, one per line. CoT received here is rendered on the map. Defaults to known CoT-bearing prefixes rather than everything (**) -- use ** for a one-off full mesh audit, since large non-CoT traffic (video, imagery, pcap replay) costs bandwidth/battery to receive and discard even when it's filtered out locally."
         android:dialogTitle="Enter one key expression per line"
+        android:defaultValue="**/ITA-EFDI/**\n**/tak/cot/v1/**\n**/PATCH/tracks/v1/**\n**/tactiql/**"
         android:inputType="textMultiLine|textNoSuggestions" />
 
     <com.atakmap.android.gui.PanEditTextPreference

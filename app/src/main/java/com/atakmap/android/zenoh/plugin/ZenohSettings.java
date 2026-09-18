@@ -23,6 +23,23 @@ public class ZenohSettings {
     public static final String PREF_SUBSCRIBE_TOPICS = "zenohSubscribeTopics";
     public static final String PREF_PUBLISH_TOPIC = "zenohPublishTopic";
 
+    /**
+     * Default subscribe list for a fresh install: the key-expression
+     * prefixes confirmed (docs/zenoh-mesh-investigation.md,
+     * docs/zenoh-additional-traffic-survey.md) to actually carry CoT, each
+     * with a leading {@code **} since the anchor (first segment) is a
+     * different, unpredictable slot id per publisher. Deliberately narrower
+     * than {@code **}: a broad subscription means receiving every other
+     * vendor's traffic too, including large non-CoT payloads (imagery,
+     * pcap replay, live video) that cost bandwidth/battery to receive and
+     * discard even though decode() rejects them cheaply once received.
+     * Trade-off: this list can't see CoT from a publisher on a prefix not
+     * already cataloged here -- switch to {@code **} for a one-off full
+     * audit of the mesh, same as the investigation did.
+     */
+    public static final String DEFAULT_SUBSCRIBE_TOPICS =
+            "**/ITA-EFDI/**\n**/tak/cot/v1/**\n**/PATCH/tracks/v1/**\n**/tactiql/**";
+
     private final AtakPreferences prefs;
 
     public ZenohSettings(Context pluginContext) {
@@ -66,7 +83,7 @@ public class ZenohSettings {
     }
 
     public List<String> getSubscribeTopics() {
-        String raw = prefs.get(PREF_SUBSCRIBE_TOPICS, "");
+        String raw = prefs.get(PREF_SUBSCRIBE_TOPICS, DEFAULT_SUBSCRIBE_TOPICS);
         List<String> topics = new ArrayList<>();
         for (String line : raw.split("\\r?\\n")) {
             String topic = line.trim();
