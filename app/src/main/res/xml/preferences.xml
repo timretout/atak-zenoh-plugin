@@ -48,9 +48,9 @@
 
     <com.atakmap.android.gui.PanEditTextPreference
         android:key="zenohPublishTopic"
-        android:title="Publish Topic"
-        android:summary="Zenoh key expression that local CoT traffic is published to"
-        android:dialogTitle="Enter the publish key expression"
+        android:title="Publish Topic Prefix"
+        android:summary="Key expression prefix for local CoT traffic; each unit's own uid is appended as the last segment (e.g. prefix/UID-1234)"
+        android:dialogTitle="Enter the publish key-expression prefix"
         android:inputType="textNoSuggestions|textUri" />
 
 </PreferenceScreen>

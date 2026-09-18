@@ -53,7 +53,15 @@ public class ZenohSettings {
         return prefs.get(PREF_CLIENT_KEY_PATH, "");
     }
 
-    public String getPublishTopic() {
+    /**
+     * The stable key-expression prefix outbound CoT publishes under -- each
+     * event's own uid is appended as the last segment at publish time (see
+     * {@link CotBridgeService#buildPublishKey}), per the fabric's
+     * per-entity-state (Pattern B) guidance in
+     * docs/zenoh-publish-key-design.md. Not a complete, publishable key on
+     * its own.
+     */
+    public String getPublishTopicPrefix() {
         return prefs.get(PREF_PUBLISH_TOPIC, "");
     }
 

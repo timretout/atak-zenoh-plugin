@@ -38,6 +38,7 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
     private CotServiceRemote cotServiceRemote;
     private boolean running = false;
+    private volatile String publishTopicPrefix;
 
     public CotBridgeService(Context pluginContext) {
         this.pluginContext = pluginContext;
@@ -53,10 +54,9 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
         try {
             List<String> subscribeTopics = settings.getSubscribeTopics();
-            String publishTopic = settings.getPublishTopic();
+            publishTopicPrefix = settings.getPublishTopicPrefix();
 
-            bridge.start(settings.buildConfigJson5(), subscribeTopics, publishTopic,
-                    this::onZenohSampleReceived);
+            bridge.start(settings.buildConfigJson5(), subscribeTopics, this::onZenohSampleReceived);
 
             cotServiceRemote = new CotServiceRemote();
             cotServiceRemote.setCotEventListener(this);
@@ -74,7 +74,7 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
             running = true;
             Log.i(TAG, "Zenoh bridge started: endpoint=" + settings.getRouterEndpoint()
-                    + " subscribe=" + subscribeTopics + " publish=" + publishTopic);
+                    + " subscribe=" + subscribeTopics + " publishPrefix=" + publishTopicPrefix);
         } catch (final Throwable t) {
             Log.e(TAG, "Failed to start Zenoh bridge", t);
             stop();
@@ -103,6 +103,7 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             cotServiceRemote = null;
         }
         bridge.stop();
+        publishTopicPrefix = null;
         running = false;
     }
 
@@ -214,10 +215,54 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             return;
         if (extra != null && extra.getBoolean(EXTRA_FROM_ZENOH, false))
             return;
+        String prefix = publishTopicPrefix;
+        if (prefix == null || prefix.isEmpty())
+            return;
         try {
-            bridge.publish(event.toString());
+            bridge.publish(buildPublishKey(prefix, event.getUID()), event.toString());
         } catch (Throwable t) {
             Log.e(TAG, "Failed to publish CoT event to Zenoh", t);
         }
+    }
+
+    /**
+     * Builds the Zenoh key a CoT event publishes under: {@code prefix} with
+     * the event's own uid appended as the last, selectable key segment.
+     *
+     * This follows the fabric's per-entity-state guidance (Pattern B, see
+     * docs/zenoh-publish-key-design.md and
+     * hello-galaxy-zenoh-patterns/docs/identity-spectrum.md, which maps
+     * tracks and CoT to "Pattern B keyed by the track/CoT uid"): a single
+     * fixed publish key for every event -- the prior behavior -- buries the
+     * discriminator in the payload, so a latest-value storage watching that
+     * key only ever retains whichever unit happened to publish most
+     * recently, and other consumers can't select "just this unit" by key.
+     */
+    static String buildPublishKey(String prefix, String uid) {
+        String trimmed = prefix;
+        while (trimmed.endsWith("/"))
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        return trimmed + "/" + sanitizeKeySegment(uid);
+    }
+
+    /**
+     * Zenoh key-expression segments can't safely carry arbitrary CoT uid
+     * content (some CoT types, e.g. GeoChat, use uids with spaces/dots
+     * outside a plain track uid), and {@code *}/{@code $}/{@code #} have
+     * wildcard/reserved meaning in a key expression. Anything outside the
+     * conservative safe set becomes {@code _} rather than risking an
+     * invalid key expression at publish time.
+     */
+    private static String sanitizeKeySegment(String raw) {
+        if (raw == null || raw.isEmpty())
+            return "_";
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            boolean safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+            sb.append(safe ? c : '_');
+        }
+        return sb.toString();
     }
 }

@@ -5,7 +5,6 @@ import io.zenoh.Session
 import io.zenoh.Zenoh
 import io.zenoh.keyexpr.KeyExpr
 import io.zenoh.keyexpr.intoKeyExpr
-import io.zenoh.pubsub.Publisher
 import io.zenoh.pubsub.Subscriber
 
 /**
@@ -31,13 +30,16 @@ fun interface ZenohSampleListener {
 class ZenohBridge {
 
     private var session: Session? = null
-    private var publisher: Publisher? = null
     private val subscribers = mutableListOf<Subscriber<Unit>>()
 
     /**
-     * Opens a client-mode session from the given JSON5 config, declares a
-     * subscriber for each topic (routing payloads to [listener]) and, if
-     * [publishTopic] is non-blank, declares a publisher for it.
+     * Opens a client-mode session from the given JSON5 config and declares a
+     * subscriber for each topic, routing payloads to [listener].
+     *
+     * Outbound publishing has no fixed key to declare up front -- each CoT
+     * event publishes under its own per-entity key (see [publish]), per the
+     * fabric's Pattern-B guidance (docs/zenoh-publish-key-design.md) -- so
+     * there is no publisher declared here.
      *
      * Any failure leaves the bridge fully stopped (no partial state) and is
      * rethrown to the caller.
@@ -47,7 +49,6 @@ class ZenohBridge {
     fun start(
         configJson5: String,
         subscribeTopics: List<String>,
-        publishTopic: String?,
         listener: ZenohSampleListener
     ) {
         stop()
@@ -63,35 +64,33 @@ class ZenohBridge {
                 }).getOrThrow()
                 subscribers.add(subscriber)
             }
-
-            if (!publishTopic.isNullOrBlank()) {
-                val pubKeyExpr: KeyExpr = publishTopic.intoKeyExpr().getOrThrow()
-                publisher = newSession.declarePublisher(pubKeyExpr).getOrThrow()
-            }
         } catch (t: Throwable) {
             stop()
             throw t
         }
     }
 
-    /** Publishes [xml] to the configured publish topic. No-op if not started or unconfigured. */
+    /**
+     * Publishes [xml] to [keyExpr] (the caller's per-entity key -- see
+     * CotBridgeService.buildPublishKey). No-op if not started.
+     */
     @Synchronized
-    fun publish(xml: String) {
-        publisher?.put(xml)
+    @Throws(Exception::class)
+    fun publish(keyExpr: String, xml: String) {
+        val session = this.session ?: return
+        session.put(keyExpr.intoKeyExpr().getOrThrow(), xml).getOrThrow()
     }
 
     @Synchronized
     fun isRunning(): Boolean = session != null
 
-    /** Closes the publisher, all subscribers and the session, in that order. Safe to call repeatedly. */
+    /** Closes all subscribers and the session, in that order. Safe to call repeatedly. */
     @Synchronized
     fun stop() {
         for (subscriber in subscribers) {
             runCatching { subscriber.close() }
         }
         subscribers.clear()
-        runCatching { publisher?.close() }
-        publisher = null
         runCatching { session?.close() }
         session = null
     }
