@@ -60,13 +60,87 @@ info:
     that wants "latest value per entity" must be a storage or cache on the
     mesh subscribing to these keys.
 
+    ## Versioning and compatibility
+
+    - **This document** is versioned `0.x`: the contract is young and may
+      change between releases. There is no deprecation policy and no notice
+      period; a change is recorded in this file's git history.
+    - **The wire contract** carries its own version in the key prefix (for
+      example `.../v1/...`). The operator chooses the prefix, so the plugin
+      cannot enforce it; a breaking payload change is expected to move to a
+      new prefix rather than change `v1` in place.
+    - **The payload** is ATAK's CoT, so it moves with ATAK's own releases.
+      Additions, especially new `<detail>` children, are normal and are not a
+      breaking change: consumers must ignore elements and attributes they do
+      not recognise.
+    - There is **no schema registry** and no compatibility mode to configure.
+      The schema is the `cotEventXml` definition in this file.
+
+    ## Rates and limits
+
+    The plugin has **no rate limiter**. It publishes whenever one of the
+    triggers above fires, and there is no throttling response (no 429
+    equivalent, no `Retry-After`) because the publish is a fire-and-forget
+    Zenoh `put`. Measured on 2026-09-18:
+
+    | Source | Rate | Payload size |
+    |---|---|---|
+    | Ownship | 1 per 15 s (4 per minute) | about 0.6 kB |
+    | Each persisted marker | about 1 per 10 s (6 per minute) | about 0.9 kB |
+
+    With the three persisted markers of the capture, that was about 22
+    samples a minute from one phone. The plugin sets **no payload size limit
+    of its own**; any ceiling is the router's or Zenoh transport's, which the
+    plugin does not configure. Any admission or quota policy on the mesh
+    (for example a cap on distinct keys per tenant) is set by the operator
+    and is not visible to the plugin.
+
+    ## Failures, retry and dead letters
+
+    A publish has no response, so there is **no error payload and no shared
+    error shape**: nothing is ever published to the mesh to report a
+    failure. Failures are handled on the phone:
+
+    | Failure | What the plugin does |
+    |---|---|
+    | Router unreachable, TLS or mutual-TLS handshake refused | The first failed start shows an on-screen message ("Zenoh bridge failed to start ... will keep retrying"), then retries. |
+    | A publish throws (the session has gone bad) | The session is torn down and the connection retried. |
+    | ATAK's comms connection drops (for example when the phone sleeps) | The session is torn down and the connection retried. |
+    | The router link is congested | Zenoh drops the sample silently (congestion control `drop`); the plugin is not told. |
+
+    **Retry** waits 2, 5, 15, 30 and then 60 seconds between attempts, holds at
+    60 seconds, and continues until the user stops the plugin. An
+    on-screen message ("Zenoh bridge reconnected") is shown on recovery.
+
+    There is **no dead-letter queue and no replay**: a sample dropped or
+    missed during an outage is gone. Recovery is the next periodic publish,
+    which for ownship is within 15 seconds of the bridge coming back.
+  contact:
+    name: ATAK Zenoh plugin maintainers
+    url: https://github.com/timretout/atak-zenoh-plugin
+  externalDocs:
+    description: Design rationale for the per-entity publish key
+    url: https://github.com/timretout/atak-zenoh-plugin/blob/main/docs/zenoh-publish-key-design.md
+
 servers:
   mesh:
     host: '{router}'
     protocol: zenoh
+    summary: The Zenoh router the plugin connects to as a client.
     description: |
-      The Zenoh router the plugin connects to as a **client** (not peer)
-      session. The endpoint is user-configured; the plugin prefixes it with
+      ## Roles
+
+      - **Publisher:** the plugin, running inside ATAK on the phone. It opens
+        a Zenoh **client**-mode session (not peer) and publishes.
+      - **Router:** the mesh's Zenoh router, run by whoever operates the mesh,
+        not by the plugin. It routes samples to matching subscribers. It does
+        not persist or replay them: a subscriber that was not connected when
+        a sample was published does not get it later.
+      - **Subscribers:** any Zenoh client, in any language, with access to the
+        keys. No SDK from this project is needed to consume the data; the wire
+        protocol is Zenoh and the payload is CoT XML.
+
+      The endpoint is user-configured; the plugin prefixes it with
       `tcp/` or `tls/` depending on the "TLS" preference, e.g.
       `tls/router.example.net:7447`.
 
@@ -74,6 +148,20 @@ servers:
       Zenoh as the trust root. If a client certificate and key are both
       configured, it also presents them (mutual TLS); otherwise TLS is
       server-auth only.
+
+      ## Session, keep-alive and backpressure
+
+      - **Session state:** the session opens when ATAK starts the plugin and
+        closes when it stops. There is no session resumption: after any
+        failure the session is torn down and opened afresh, and the plugin
+        re-subscribes to its inbound topics. Nothing published while it was
+        down is replayed.
+      - **Keep-alive:** the plugin sets no keep-alive or lease of its own. The
+        only settings it hands to Zenoh are the mode, the router endpoint and
+        the TLS files, so Zenoh's transport defaults apply.
+      - **Backpressure:** the publisher never blocks. Under congestion Zenoh
+        drops the sample (congestion control `drop`), and nothing is signalled
+        back to the plugin or to subscribers.
     variables:
       router:
         description: Router `host:port`, as entered in the plugin's preferences.
@@ -81,6 +169,9 @@ servers:
           - router.example.net:7447
     security:
       - $ref: '#/components/securitySchemes/optionalMutualTls'
+    tags:
+      - name: zenoh
+        description: Zenoh client-mode session over TCP or TLS.
 
 channels:
   cotEntity:
@@ -95,6 +186,18 @@ channels:
 
       The prefix is expected to carry the schema version (for example
       `tak/cot/v1`), so a breaking payload change can move to a new prefix.
+
+      ## Consumers and scaling
+
+      Zenoh has **no consumer groups and no partitions**. Every subscriber
+      whose key expression matches receives every sample; nothing is
+      load-balanced between subscribers. The `uid` segment is the
+      partitioning dimension, so a consumer that needs to split the work
+      shards by key expression, for example `<prefix>/ANDROID-$*` for the
+      ATAK devices and `<prefix>/*` for everything. Several phones can share
+      one prefix; their uids keep them apart. Consumers that need an
+      at-least-once guarantee or a backlog must add it themselves (a storage
+      on the mesh), because the plugin retains nothing.
     parameters:
       prefix:
         description: |
@@ -127,16 +230,27 @@ channels:
 operations:
   publishCotEvent:
     title: Publish a CoT event
+    summary: Publish one CoT event for one entity to its own key.
+    description: |
+      Fire-and-forget Zenoh `put` of one CoT `<event>` to `<prefix>/<uid>`.
+      Triggers, delivery settings, rates, retry and failure handling are
+      described in the document description and on the `mesh` server.
     action: send
+    tags:
+      - name: cot
+        description: Cursor-on-Target event traffic.
+      - name: outbound
+        description: Data the plugin sends to the mesh; nothing is received here.
     channel:
       $ref: '#/channels/cotEntity'
     messages:
       - $ref: '#/channels/cotEntity/messages/cotEvent'
-    x-zenoh:
-      reliability: reliable
-      congestionControl: drop
-      priority: data
-      express: false
+    bindings:
+      x-zenoh:
+        reliability: reliable
+        congestionControl: drop
+        priority: data
+        express: false
 
 components:
   messages:
@@ -150,7 +264,9 @@ components:
         on the encoding: recognise the payload by its leading `<`.
       contentType: application/xml
       payload:
-        $ref: '#/components/schemas/cotEventXml'
+        schemaFormat: application/schema+json;version=draft-07
+        schema:
+          $ref: '#/components/schemas/cotEventXml'
       examples:
         - name: ownshipPosition
           summary: >-
@@ -197,7 +313,10 @@ components:
 
   schemas:
     cotEventXml:
-      type: string
+      type: object
+      x-xml:
+        rootElement: event
+        declaration: <?xml version='1.0' encoding='UTF-8' standalone='yes'?>
       description: |
         A single CoT `<event>` document, UTF-8: the string form of ATAK's own
         `CotEvent`. For shared and self map items the plugin builds it with
@@ -205,6 +324,14 @@ components:
         dispatcher is published as ATAK produced it. The content is ATAK's,
         with one exception: on the ownship event the plugin replaces `type`
         and `stale` (see below).
+
+        **How this schema maps to the XML.** The wire form is XML, not JSON;
+        this schema describes the same content as a typed model. The
+        properties of `event` and of `point` are XML **attributes**, and
+        `point` and `detail` are child elements. Inside `detail`, each
+        property is a child element and its own scalar properties are that
+        element's attributes, except `remarks`, whose value is the element's
+        text.
 
         There is no XSD for CoT and none is claimed here. Observed on the
         wire (2026-09-18, all samples):
@@ -244,6 +371,259 @@ components:
         - `time` comes from the phone's own clock. On the test phone that
           was about two minutes behind the workstation that captured it.
 
+        **Size.** Observed payloads were about 0.6 kB (ownship) and 0.9 kB
+        (markers). The plugin imposes no ceiling; a richer `<detail>` makes a
+        larger payload.
+      required: [version, uid, type, time, start, stale, how, point]
+      properties:
+        version:
+          type: string
+          enum: ['2.0']
+          description: CoT schema version. Always `2.0` on the wire.
+          examples: ['2.0']
+        uid:
+          type: string
+          minLength: 1
+          description: |
+            Identifier of the entity, stable for the life of that entity and
+            unique on the mesh. ATAK devices use `ANDROID-` followed by 16
+            hex digits (the device uid, also the ownship marker's uid);
+            items a user creates use a random UUID; other item types use
+            their own scheme (chat uses `GeoChat.<sender uid>.<room>.<id>`,
+            covered only by a unit test, not captured). The channel key is
+            this value sanitised (see the `uid` channel parameter), so read
+            the payload's value when the exact uid matters.
+          examples:
+            - ANDROID-0123456789abcdef
+            - 0d3f93ac-b9bc-4d44-94ff-9e3db6a6970d
+        type:
+          type: string
+          pattern: '^[A-Za-z](-[A-Za-z0-9]+)*$'
+          description: |
+            CoT type code: hyphen-separated, for example `a-f-G-U-C` (atom,
+            friendly, ground, unit, combat) or `a-f-G-I` (friendly ground
+            installation). Not an enumeration; ATAK produces many.
+          examples: [a-f-G-U-C, a-f-G-I]
+        time:
+          type: string
+          format: date-time
+          description: |
+            When this event was generated, UTC, ISO 8601 with milliseconds
+            and a trailing `Z`. From the phone's clock. Refreshed on every
+            publish.
+          examples: ['2026-09-18T15:01:43.109Z']
+        start:
+          type: string
+          format: date-time
+          description: |
+            Start of the event's validity, same format as `time`. Equal to
+            `time` on every sample captured.
+          examples: ['2026-09-18T15:01:43.109Z']
+        stale:
+          type: string
+          format: date-time
+          description: |
+            When the event stops being valid, same format as `time`. 75
+            seconds after `time` on ownship; one year after `time` on
+            markers (see above).
+          examples: ['2026-09-18T15:02:58.109Z']
+        how:
+          type: string
+          description: |
+            CoT "how" code: how the position was obtained. Observed `m-g`
+            (machine-derived, GPS) on ownship and `h-g-i-g-o` (human-entered)
+            on user-created markers. Not an enumeration.
+          examples: [m-g, h-g-i-g-o]
+        access:
+          type: string
+          description: |
+            Access marking. Present on ownship and persisted markers; only
+            `Undefined` was observed. Optional.
+          examples: [Undefined]
+        point:
+          type: object
+          description: The event's position, WGS84.
+          required: [lat, lon, hae, ce, le]
+          properties:
+            lat:
+              type: number
+              minimum: -90
+              maximum: 90
+              description: Latitude, decimal degrees.
+              examples: [51.5]
+            lon:
+              type: number
+              minimum: -180
+              maximum: 180
+              description: Longitude, decimal degrees.
+              examples: [-0.12]
+            hae:
+              type: number
+              description: Height above the WGS84 ellipsoid, metres.
+              examples: [73.258]
+            ce:
+              type: number
+              minimum: 0
+              description: |
+                Circular position error, metres. `9999999.0` means unknown.
+              examples: [12.7, 9999999.0]
+            le:
+              type: number
+              minimum: 0
+              description: |
+                Linear (altitude) error, metres. `9999999.0` means unknown.
+              examples: [9999999.0]
+        detail:
+          type: object
+          additionalProperties: true
+          description: |
+            Open-ended container of extension elements; see the notes above.
+            Only the children seen in the capture are listed, and all are
+            optional. Ignore any you do not recognise.
+          properties:
+            contact:
+              type: object
+              description: Who or what the entity is.
+              properties:
+                callsign:
+                  type: string
+                  description: Human-readable name shown on the map.
+                  examples: [EXAMPLE-1]
+            uid:
+              type: object
+              description: Device identity element; ownship only in the capture.
+              properties:
+                Droid:
+                  type: string
+                  description: The device's callsign.
+                  examples: [EXAMPLE-1]
+            track:
+              type: object
+              description: Movement of the entity.
+              properties:
+                course:
+                  type: number
+                  minimum: 0
+                  maximum: 360
+                  description: Heading over ground, degrees true.
+                  examples: [114.4]
+                speed:
+                  type: number
+                  minimum: 0
+                  description: Speed over ground, metres per second.
+                  examples: [0.0]
+            precisionlocation:
+              type: object
+              description: Where the altitude and position came from.
+              properties:
+                altsrc:
+                  type: string
+                  description: Altitude source. Observed `GPS`, `CALC`, `SRTM1`.
+                  examples: [GPS]
+                geopointsrc:
+                  type: string
+                  description: Position source. Observed `GPS`, `CALC`, `ESTIMATED`.
+                  examples: [GPS]
+            color:
+              type: object
+              description: Colour of the map item.
+              properties:
+                argb:
+                  type: integer
+                  minimum: -2147483648
+                  maximum: 2147483647
+                  description: |
+                    Colour as a signed 32-bit ARGB integer, so opaque colours
+                    are negative.
+                  examples: [-16776961, -1]
+            status:
+              type: object
+              description: Status flags.
+              properties:
+                readiness:
+                  type: boolean
+                  description: Marker readiness flag, written `true` or `false`.
+                  examples: [true]
+            remarks:
+              type: string
+              description: Free text; the element's text content, often empty.
+              examples: ['']
+            archive:
+              type: object
+              description: |
+                Empty flag element: its presence means ATAK keeps the item
+                after it goes stale. It has no attributes.
+            creator:
+              type: object
+              description: Who created a marker.
+              properties:
+                uid:
+                  type: string
+                  description: uid of the creating device.
+                callsign:
+                  type: string
+                  description: Callsign of the creating device.
+                time:
+                  type: string
+                  format: date-time
+                  description: When the marker was created.
+                type:
+                  type: string
+                  description: CoT type of the creating device.
+            link:
+              type: object
+              description: A relationship to another entity; here, to the creator.
+              properties:
+                uid:
+                  type: string
+                  description: uid of the related entity.
+                production_time:
+                  type: string
+                  format: date-time
+                  description: When the relationship was produced.
+                type:
+                  type: string
+                  description: CoT type of the related entity.
+                parent_callsign:
+                  type: string
+                  description: Callsign of the related entity.
+                relation:
+                  type: string
+                  description: Relationship code. Observed `p-p` (parent-point).
+                  examples: [p-p]
+            usericon:
+              type: object
+              description: Custom icon of a marker.
+              properties:
+                iconsetpath:
+                  type: string
+                  description: Icon set path selecting the icon.
+                  examples: ['COT_MAPPING_2525C/a-f/a-f-G-I']
+            __milicon:
+              type: object
+              description: MIL-STD-2525 icon of a marker.
+              properties:
+                id:
+                  type: string
+                  description: 2525 symbol identifier.
+                  examples: ['SFG*I-----H****']
+            __milsym:
+              type: object
+              description: MIL-STD-2525 symbol of a marker.
+              properties:
+                id:
+                  type: string
+                  description: 2525 symbol identifier.
+                  examples: ['SFG*I-----H****']
+            __renderhints:
+              type: object
+              description: Rendering hints for the map; ownship only in the capture.
+              properties:
+                iconrotate:
+                  type: boolean
+                  description: Whether the icon rotates with the heading.
+                  examples: [true]
+
   securitySchemes:
     optionalMutualTls:
       type: X509
@@ -252,3 +632,10 @@ components:
         and key are presented (mutual TLS) only when both are configured.
         With TLS off the connection is plain `tcp`, with no transport-level
         authentication.
+
+        **Getting a credential.** The plugin has no enrolment flow. The CA
+        certificate, client certificate and private key are issued out of band
+        by whoever operates the router (typically as an onboarding bundle),
+        copied onto the phone, and their file paths entered in the plugin's
+        preferences. The private key is never sent anywhere; Zenoh reads it
+        locally to complete the handshake.
