@@ -14,9 +14,11 @@ import com.atakmap.android.maps.MapEventDispatcher;
 import com.atakmap.android.maps.MapItem;
 import com.atakmap.android.maps.Marker;
 import com.atakmap.android.maps.MapView;
+import com.atakmap.android.preference.AtakPreferences;
 import com.atakmap.comms.CotServiceRemote;
 import com.atakmap.coremap.cot.event.CotEvent;
 import com.atakmap.coremap.log.Log;
+import com.atakmap.coremap.maps.time.CoordinatedTime;
 
 import java.util.List;
 import java.util.Timer;
@@ -85,6 +87,28 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
 
     /** How often the self marker republishes, independent of any share/broadcast action. */
     private static final long SELF_POSITION_INTERVAL_MS = 15_000L;
+
+    /**
+     * How long an ownship report stays fresh, from its {@code time}: five
+     * missed beats. Covers the 30-40 s publish gaps seen when the phone
+     * sleeps and the bridge reconnects, while still letting a consumer tell
+     * within about a minute that ownship has stopped.
+     */
+    static final long SELF_STALE_MS = 5 * SELF_POSITION_INTERVAL_MS;
+
+    /**
+     * ATAK's SharedPreferences key for the user's own-unit CoT type ("My
+     * Display Type"). Read in ATAK's own {@code LocationMapComponent} and
+     * {@code CoTSelector} as a string, defaulting to
+     * {@link #DEFAULT_UNIT_TYPE}.
+     */
+    private static final String PREF_UNIT_TYPE = "locationUnitType";
+
+    /** ATAK's own default for {@link #PREF_UNIT_TYPE} (its {@code default_cot_type} string resource). */
+    static final String DEFAULT_UNIT_TYPE = "a-f-G-U-C";
+
+    /** The type ATAK's generic converter gives the self marker: a marker type, not a CoT type code. */
+    private static final String SELF_MARKER_TYPE = "self";
 
     /** Reconnect backoff ladder; holds at the last value for a prolonged outage. */
     private static final long[] RECONNECT_BACKOFF_MS = {2_000L, 5_000L, 15_000L, 30_000L, 60_000L};
@@ -396,7 +420,18 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         publishCotEvent(cotEvent);
     }
 
-    /** Republishes the self ("ownship") marker on {@link #SELF_POSITION_INTERVAL_MS}. */
+    /**
+     * Republishes the self ("ownship") marker on {@link #SELF_POSITION_INTERVAL_MS}.
+     *
+     * {@link CotEventFactory#createCotEvent} is ATAK's generic map-item
+     * converter, and for the self marker it yields {@code type='self'} and a
+     * one-year {@code stale} -- fine for a persisted marker, useless to
+     * another mesh consumer, which can't recognise a friendly unit from
+     * {@code self} nor tell when ownship stopped publishing. ATAK's own
+     * position report (real unit type, short stale) leaves by a route
+     * plugins can't hook (see the class doc), so this repairs the two fields
+     * on the ownship event only. Persisted/shared markers are untouched.
+     */
     private void publishSelfPosition() {
         MapView mapView = MapView.getMapView();
         if (mapView == null)
@@ -407,7 +442,40 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         CotEvent event = CotEventFactory.createCotEvent(self);
         if (event == null)
             return;
+
+        String unitType = AtakPreferences.getInstance(pluginContext).get(PREF_UNIT_TYPE, DEFAULT_UNIT_TYPE);
+        event.setType(outboundOwnshipType(event.getType(), unitType));
+        CoordinatedTime time = event.getTime();
+        long timeMs = time != null ? time.getMilliseconds() : CoordinatedTime.currentTimeMillis();
+        event.setStale(new CoordinatedTime(ownshipStaleMillis(timeMs)));
+
         publishCotEvent(event);
+    }
+
+    /**
+     * The CoT {@code type} an ownship event goes out with. ATAK's converter
+     * labels the self marker {@code "self"}, which is not a CoT type code;
+     * that becomes the user's configured unit type. Any other marker type is
+     * already a real one and is left alone.
+     *
+     * A configured value that isn't an atom type ({@code a-...}) -- unset,
+     * blank, or something a future ATAK stores differently -- falls back to
+     * ATAK's own default rather than putting junk on the wire.
+     */
+    static String outboundOwnshipType(String markerType, String configuredUnitType) {
+        if (!SELF_MARKER_TYPE.equals(markerType))
+            return markerType;
+        if (configuredUnitType != null) {
+            String trimmed = configuredUnitType.trim();
+            if (trimmed.startsWith("a-") && trimmed.length() > 2)
+                return trimmed;
+        }
+        return DEFAULT_UNIT_TYPE;
+    }
+
+    /** {@code stale} for an ownship event published at {@code timeMs}. */
+    static long ownshipStaleMillis(long timeMs) {
+        return timeMs + SELF_STALE_MS;
     }
 
     /**

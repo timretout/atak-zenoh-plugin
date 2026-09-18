@@ -19,7 +19,16 @@ info:
 
     - **Ownship**, every 15 seconds (observed 13-16 s). ATAK does not
       surface ownship through the map events below, so it has its own timer.
-      Its `<event>` has `type='self'` (see the payload notes).
+      ATAK's generic converter would label it `type='self'` with a stale one
+      year out, neither of which another consumer can use, so the plugin
+      rewrites those two fields on the ownship event before publishing: the
+      `type` becomes the user's configured unit type (ATAK's "My Display
+      Type" preference, `locationUnitType`; `a-f-G-U-C` when unset or not a
+      CoT type) and `stale` becomes 75 seconds after `time`, five publish
+      intervals. Nothing else on the event is changed, and no other item is
+      touched. Ownship still lacks the usual PLI details (`__group`,
+      `takv`, `status`, a `contact` endpoint), which ATAK's own position
+      report carries but which the plugin does not add.
     - **Persisted map items**, `MapEvent.ITEM_PERSIST` not marked `internal`.
       In the capture, three long-lived markers were re-published about every
       10 seconds, each time with a fresh `time` and identical position. Which
@@ -147,17 +156,19 @@ components:
           summary: >-
             Self position, published under
             tak/cot/v1/ANDROID-0123456789abcdef. Structure captured from a
-            real device; the identifying values are replaced.
+            real device running the plugin with the default unit type; the
+            identifying values are replaced.
           payload: >-
             <?xml version='1.0' encoding='UTF-8' standalone='yes'?><event
-            version='2.0' uid='ANDROID-0123456789abcdef' type='self'
-            time='2026-09-18T14:39:19.224Z' start='2026-09-18T14:39:19.224Z'
-            stale='2027-09-18T14:39:19.224Z' how='m-g' access='Undefined'><point
-            lat='51.5' lon='-0.12' hae='73.258' ce='20.7' le='9999999.0'
+            version='2.0' uid='ANDROID-0123456789abcdef' type='a-f-G-U-C'
+            time='2026-09-18T15:01:43.109Z' start='2026-09-18T15:01:43.109Z'
+            stale='2026-09-18T15:02:58.109Z' how='m-g' access='Undefined'><point
+            lat='51.5' lon='-0.12' hae='73.258' ce='12.7' le='9999999.0'
             /><detail><__renderhints><iconrotate>true</iconrotate></__renderhints><color
-            argb='-16776961'/><precisionlocation altsrc='CALC'
-            geopointsrc='ESTIMATED'/><contact callsign='EXAMPLE-1'/><track
-            course='114.4' speed='0.0'/><uid Droid='EXAMPLE-1'/></detail></event>
+            argb='-16776961'/><track course='114.4'
+            speed='0.0'/><precisionlocation altsrc='GPS'
+            geopointsrc='GPS'/><contact callsign='EXAMPLE-1'/><uid
+            Droid='EXAMPLE-1'/></detail></event>
         - name: persistedMarker
           summary: >-
             A user-created friendly ground-installation marker, published
@@ -191,8 +202,9 @@ components:
         A single CoT `<event>` document, UTF-8: the string form of ATAK's own
         `CotEvent`. For shared and self map items the plugin builds it with
         ATAK's `CotEventFactory`; CoT that passes through ATAK's internal
-        dispatcher is published as ATAK produced it. Either way the content
-        is ATAK's, not something the plugin composes.
+        dispatcher is published as ATAK produced it. The content is ATAK's,
+        with one exception: on the ownship event the plugin replaces `type`
+        and `stale` (see below).
 
         There is no XSD for CoT and none is claimed here. Observed on the
         wire (2026-09-18, all samples):
@@ -206,18 +218,24 @@ components:
           milliseconds), `how`, and, on persisted markers and ownship,
           `access='Undefined'`.
         - Children are `<point lat lon hae ce le/>` and `<detail>`.
-        - **`type`** is a CoT type code for markers (`a-f-G-I`), but ownship
-          is published with the literal `type='self'`, which is ATAK's
-          internal marker type and not a CoT type code. Consumers that
-          expect `a-f-...` will not recognise ownship as a friendly unit from
-          this field alone; the `uid` (`ANDROID-...`) and `<uid Droid=...>`
-          detail identify it.
-        - **`stale`** is not a freshness horizon. Both ownship and markers
-          carry `stale` one year after `time`, so liveness has to be judged
-          from `time` (which is refreshed on every publish) rather than from
-          `stale`.
+        - **`type`** is a CoT type code on every event. Markers carry
+          whatever ATAK gave them (`a-f-G-I`). Ownship carries the user's
+          configured unit type, read from ATAK's `locationUnitType`
+          preference (default `a-f-G-U-C`); it is `a-f-...` for any type
+          ATAK's own picker offers. ATAK's converter would have produced
+          `self`, its internal marker type, and the plugin replaces that. If
+          the preference is unset or is not an atom type (`a-...`), ownship
+          falls back to `a-f-G-U-C`. Only the default was exercised on the
+          device; a custom unit type has not been captured.
+        - **`stale`** means different things by item. On **ownship** it is
+          `time` plus 75 seconds (five 15-second intervals, chosen to ride
+          out the 30-40 second gaps seen when the phone sleeps), so a
+          consumer can treat ownship as gone once `stale` passes. On
+          **markers** it is one year after `time`, ATAK's normal value for a
+          long-lived marker, so it says nothing about liveness there; judge
+          those from `time`, which is refreshed on every publish.
         - **`<detail>`** varies by item. Ownship carried `__renderhints`,
-          `color`, `precisionlocation`, `contact`, `track` and `uid`. The
+          `color`, `track`, `precisionlocation`, `contact` and `uid`. The
           persisted markers carried `status`, `archive`, `__milicon`,
           `__milsym`, `creator`, `link`, `color`, `usericon`,
           `precisionlocation`, `remarks` and `contact`. Other item types
