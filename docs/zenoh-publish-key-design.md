@@ -20,6 +20,13 @@ motivating real case (`<anchor>/aircraft/<id>/v1`, entity in the middle,
 version last), which still retrieves but blinds any inspection tool that
 folds a tree view on the last segment.
 
+The wire contract this design produces -- key shape, delivery settings and
+the payload as actually observed from a device -- is written up as an
+AsyncAPI document in [`asyncapi.yaml`](asyncapi.yaml). Validate it with
+`npx @asyncapi/cli validate docs/asyncapi.yaml`;
+`AsyncApiSpecTest` keeps its channel address in step with
+`buildPublishKey`.
+
 ## What changed
 
 `CotBridgeService.onCotEvent` used to call `bridge.publish(event.toString())`

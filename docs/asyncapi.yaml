@@ -1,0 +1,236 @@
+asyncapi: 3.1.0
+
+info:
+  title: ATAK Zenoh plugin - outbound CoT
+  version: 0.1.0
+  description: |
+    What the ATAK Zenoh plugin **publishes** to the Zenoh mesh: Cursor-on-Target
+    (CoT) events originating from the local ATAK instance, one Zenoh key per
+    entity. This document covers the outbound side only; what the plugin
+    accepts from the mesh is not described here.
+
+    The design rationale for the key shape (per-entity "Pattern B" keys, why
+    the uid is sanitised) is in `docs/zenoh-publish-key-design.md`.
+
+    ## What triggers a publish
+
+    Verified against a live capture from a device on 2026-09-18 unless
+    marked otherwise.
+
+    - **Ownship**, every 15 seconds (observed 13-16 s). ATAK does not
+      surface ownship through the map events below, so it has its own timer.
+      Its `<event>` has `type='self'` (see the payload notes).
+    - **Persisted map items**, `MapEvent.ITEM_PERSIST` not marked `internal`.
+      In the capture, three long-lived markers were re-published about every
+      10 seconds, each time with a fresh `time` and identical position. Which
+      ATAK behaviour drives that repeat is not established, so subscribers
+      should expect the same entity to arrive repeatedly, not once per user
+      action.
+    - **Explicit share**, `MapEvent.ITEM_SHARED`. This is in the code but was
+      not exercised in the capture, so it is not confirmed here.
+
+    CoT that the plugin itself received from the mesh and re-injected into
+    ATAK is never published back out.
+
+    ## Publishing is off until configured
+
+    The **Publish Topic Prefix** preference has no default. While it is empty
+    the plugin publishes nothing, and it still subscribes as normal.
+
+    ## Delivery
+
+    Zenoh `put` with the client-side defaults of zenoh-kotlin 1.10.1.
+    Confirmed from a subscriber: encoding `zenoh/bytes`, congestion control
+    `drop`, priority `data`, not express, no attachment. Reliability is not
+    visible to a subscriber; the library default is reliable.
+
+    Nothing is queued while the bridge is down. When the phone sleeps, ATAK's
+    comms connection drops and the plugin reconnects after a backoff, and
+    the capture showed 30-40 second gaps in every entity's publishes.
+    There is no retained or queryable state on the plugin's side; anything
+    that wants "latest value per entity" must be a storage or cache on the
+    mesh subscribing to these keys.
+
+servers:
+  mesh:
+    host: '{router}'
+    protocol: zenoh
+    description: |
+      The Zenoh router the plugin connects to as a **client** (not peer)
+      session. The endpoint is user-configured; the plugin prefixes it with
+      `tcp/` or `tls/` depending on the "TLS" preference, e.g.
+      `tls/router.example.net:7447`.
+
+      With TLS on, the plugin passes the configured CA certificate (if any) to
+      Zenoh as the trust root. If a client certificate and key are both
+      configured, it also presents them (mutual TLS); otherwise TLS is
+      server-auth only.
+    variables:
+      router:
+        description: Router `host:port`, as entered in the plugin's preferences.
+        examples:
+          - router.example.net:7447
+    security:
+      - $ref: '#/components/securitySchemes/optionalMutualTls'
+
+channels:
+  cotEntity:
+    address: '{prefix}/{uid}'
+    title: CoT event for one entity
+    description: |
+      One key per entity, with the CoT `uid` as the **last** segment. Any
+      subscriber can select a single entity by key (`<prefix>/ANDROID-1234`)
+      or all of the plugin's entities with `<prefix>/*`, and a latest-value
+      storage keeps one value per entity rather than one for the whole
+      plugin.
+
+      The prefix is expected to carry the schema version (for example
+      `tak/cot/v1`), so a breaking payload change can move to a new prefix.
+    parameters:
+      prefix:
+        description: |
+          The user-configured **Publish Topic Prefix**. May contain several
+          `/`-separated segments. Trailing `/` characters are ignored.
+          Must not contain Zenoh wildcards.
+        examples:
+          - tak/cot/v1
+          - 75a6ac3474229462d92a4eaee0b1e40c/atak-zenoh-plugin/v1/cot
+      uid:
+        description: |
+          The CoT event's `uid`, sanitised for use in a Zenoh key expression:
+          every character outside `[A-Za-z0-9._-]` becomes `_`, so `*`, `$`,
+          `#`, `?`, `/` and spaces never appear. An empty or missing uid
+          becomes `_`.
+
+          Sanitising is lossy: two distinct uids that differ only in
+          disallowed characters collapse to the same key. The original,
+          unsanitised uid is always available in the payload's `uid`
+          attribute, and consumers that need it should read it from there
+          rather than from the key.
+        examples:
+          - ANDROID-0123456789abcdef
+          - 0d3f93ac-b9bc-4d44-94ff-9e3db6a6970d
+          - GeoChat.ANDROID-0123456789abcdef.All_Chat_Rooms.6f0e2f3a-52f4-4b8e-9d7b-1d0c4a1c7e11
+    messages:
+      cotEvent:
+        $ref: '#/components/messages/cotEvent'
+
+operations:
+  publishCotEvent:
+    title: Publish a CoT event
+    action: send
+    channel:
+      $ref: '#/channels/cotEntity'
+    messages:
+      - $ref: '#/channels/cotEntity/messages/cotEvent'
+    x-zenoh:
+      reliability: reliable
+      congestionControl: drop
+      priority: data
+      express: false
+
+components:
+  messages:
+    cotEvent:
+      title: CoT event
+      summary: One CoT `<event>` as ATAK serialises it, UTF-8 XML.
+      description: |
+        `contentType` describes the payload. The Zenoh **encoding** field the
+        plugin actually stamps on the sample is the zenoh-kotlin default,
+        `zenoh/bytes`, not `application/xml`, so consumers must not dispatch
+        on the encoding: recognise the payload by its leading `<`.
+      contentType: application/xml
+      payload:
+        $ref: '#/components/schemas/cotEventXml'
+      examples:
+        - name: ownshipPosition
+          summary: >-
+            Self position, published under
+            tak/cot/v1/ANDROID-0123456789abcdef. Structure captured from a
+            real device; the identifying values are replaced.
+          payload: >-
+            <?xml version='1.0' encoding='UTF-8' standalone='yes'?><event
+            version='2.0' uid='ANDROID-0123456789abcdef' type='self'
+            time='2026-09-18T14:39:19.224Z' start='2026-09-18T14:39:19.224Z'
+            stale='2027-09-18T14:39:19.224Z' how='m-g' access='Undefined'><point
+            lat='51.5' lon='-0.12' hae='73.258' ce='20.7' le='9999999.0'
+            /><detail><__renderhints><iconrotate>true</iconrotate></__renderhints><color
+            argb='-16776961'/><precisionlocation altsrc='CALC'
+            geopointsrc='ESTIMATED'/><contact callsign='EXAMPLE-1'/><track
+            course='114.4' speed='0.0'/><uid Droid='EXAMPLE-1'/></detail></event>
+        - name: persistedMarker
+          summary: >-
+            A user-created friendly ground-installation marker, published
+            under tak/cot/v1/0d3f93ac-b9bc-4d44-94ff-9e3db6a6970d. Structure
+            captured from a real device; the identifying values are replaced.
+          payload: >-
+            <?xml version='1.0' encoding='UTF-8' standalone='yes'?><event
+            version='2.0' uid='0d3f93ac-b9bc-4d44-94ff-9e3db6a6970d'
+            type='a-f-G-I' time='2026-09-18T14:39:09.195Z'
+            start='2026-09-18T14:39:09.195Z' stale='2027-09-18T14:39:09.195Z'
+            how='h-g-i-g-o' access='Undefined'><point lat='51.5' lon='-0.12'
+            hae='70.734' ce='9999999.0' le='9999999.0' /><detail><status
+            readiness='true'/><archive/><__milicon
+            id='SFG*I-----H****'/><__milsym id='SFG*I-----H****'/><creator
+            uid='ANDROID-0123456789abcdef' callsign='EXAMPLE-1'
+            time='2026-09-18T10:04:20.876Z' type='a-f-G-U-C'/><link
+            uid='ANDROID-0123456789abcdef'
+            production_time='2026-09-18T10:04:20.876Z' type='a-f-G-U-C'
+            parent_callsign='EXAMPLE-1' relation='p-p'/><color
+            argb='-1'/><usericon
+            iconsetpath='COT_MAPPING_2525C/a-f/a-f-G-I'/><precisionlocation
+            altsrc='SRTM1'/><archive/><remarks></remarks><contact
+            callsign='Example marker'/></detail></event>
+      x-zenoh:
+        encoding: zenoh/bytes
+
+  schemas:
+    cotEventXml:
+      type: string
+      description: |
+        A single CoT `<event>` document, UTF-8: the string form of ATAK's own
+        `CotEvent`. For shared and self map items the plugin builds it with
+        ATAK's `CotEventFactory`; CoT that passes through ATAK's internal
+        dispatcher is published as ATAK produced it. Either way the content
+        is ATAK's, not something the plugin composes.
+
+        There is no XSD for CoT and none is claimed here. Observed on the
+        wire (2026-09-18, all samples):
+
+        - The document starts with an XML declaration,
+          `<?xml version='1.0' encoding='UTF-8' standalone='yes'?>`, followed
+          directly by `<event>` with no whitespace. Attributes are
+          single-quoted, and no other whitespace is added between elements.
+        - The root `<event>` has `version` (`2.0`), `uid`, `type`, the
+          timestamps `time`, `start` and `stale` (ISO 8601, UTC,
+          milliseconds), `how`, and, on persisted markers and ownship,
+          `access='Undefined'`.
+        - Children are `<point lat lon hae ce le/>` and `<detail>`.
+        - **`type`** is a CoT type code for markers (`a-f-G-I`), but ownship
+          is published with the literal `type='self'`, which is ATAK's
+          internal marker type and not a CoT type code. Consumers that
+          expect `a-f-...` will not recognise ownship as a friendly unit from
+          this field alone; the `uid` (`ANDROID-...`) and `<uid Droid=...>`
+          detail identify it.
+        - **`stale`** is not a freshness horizon. Both ownship and markers
+          carry `stale` one year after `time`, so liveness has to be judged
+          from `time` (which is refreshed on every publish) rather than from
+          `stale`.
+        - **`<detail>`** varies by item. Ownship carried `__renderhints`,
+          `color`, `precisionlocation`, `contact`, `track` and `uid`. The
+          persisted markers carried `status`, `archive`, `__milicon`,
+          `__milsym`, `creator`, `link`, `color`, `usericon`,
+          `precisionlocation`, `remarks` and `contact`. Other item types
+          will carry others; treat `<detail>` as open-ended and ignore
+          children you do not recognise.
+        - `time` comes from the phone's own clock. On the test phone that
+          was about two minutes behind the workstation that captured it.
+
+  securitySchemes:
+    optionalMutualTls:
+      type: X509
+      description: |
+        Only when the plugin's TLS preference is on: the client certificate
+        and key are presented (mutual TLS) only when both are configured.
+        With TLS off the connection is plain `tcp`, with no transport-level
+        authentication.
