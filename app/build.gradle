@@ -259,6 +259,10 @@ android {
         abortOnError true
         checkReleaseBuilds true
     }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
 }
 
 afterEvaluate {
@@ -302,6 +306,7 @@ dependencies {
     // TAK Protocol (protobuf CoT) decoding -- schemas in src/main/proto/,
     // copied from the SDK's docs/takproto.zip.
     implementation "com.google.protobuf:protobuf-javalite:4.36.2"
+    testImplementation "junit:junit:4.13.2"
 }
 
 protobuf {
