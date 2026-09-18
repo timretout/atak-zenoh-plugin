@@ -6,17 +6,39 @@ import android.os.Bundle;
 import android.widget.Toast;
 
 import com.atakmap.android.cot.CotMapComponent;
+import com.atakmap.android.importexport.CotEventFactory;
+import com.atakmap.android.maps.MapEvent;
+import com.atakmap.android.maps.MapEventDispatcher;
+import com.atakmap.android.maps.MapItem;
+import com.atakmap.android.maps.Marker;
 import com.atakmap.android.maps.MapView;
 import com.atakmap.comms.CotServiceRemote;
 import com.atakmap.coremap.cot.event.CotEvent;
 import com.atakmap.coremap.log.Log;
 
 import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
 
 /**
  * Owns the live Zenoh <-> CoT bridge: opens/closes the {@link ZenohBridge}
- * session and taps ATAK's CoT traffic via {@link CotServiceRemote} so that
- * outbound CoT gets republished to the configured Zenoh publish topic.
+ * session and republishes ATAK's own outbound CoT to the configured Zenoh
+ * publish prefix.
+ *
+ * Outbound CoT is tapped two ways, per the SDK's own {@code commout-simplesocket}
+ * sample (comms-engine-replacement pattern) rather than {@link CotServiceRemote}
+ * alone: {@link CotServiceRemote.CotEventListener} only fires for CoT that
+ * passes through ATAK's *internal* dispatcher (e.g. this plugin's own
+ * Zenoh-inbound re-injection looping back) -- confirmed empirically that a
+ * user manually sharing/broadcasting a marker does NOT invoke it, since that
+ * goes out via a separate external send path with no generic Java-level
+ * listener hook. The fix, matching the sample: listen for
+ * {@link MapEvent#ITEM_SHARED} / {@link MapEvent#ITEM_PERSIST} on
+ * {@link MapView#getMapEventDispatcher()}, and convert the shared/persisted
+ * {@link MapItem} to a real {@link CotEvent} via {@link CotEventFactory}
+ * (unlike the sample, which invents its own pipe-delimited wire format).
+ * Self-position ("ownship") isn't covered by either of those either, so it's
+ * republished on its own periodic timer, also per the sample.
  *
  * All start/stop calls are expected from the plugin's map-component
  * lifecycle hooks (onStart/onStop), not from arbitrary threads.
@@ -33,10 +55,16 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
      */
     private static final String EXTRA_FROM_ZENOH = "com.atakmap.android.zenoh.plugin.FROM_ZENOH";
 
+    /** How often the self marker republishes, independent of any share/broadcast action. */
+    private static final long SELF_POSITION_INTERVAL_MS = 15_000L;
+
     private final Context pluginContext;
     private final ZenohBridge bridge = new ZenohBridge();
+    private final Timer selfPositionTimer = new Timer("ZenohSelfPosition", true);
 
     private CotServiceRemote cotServiceRemote;
+    private MapEventDispatcher.MapEventDispatchListener outboundMapEventListener;
+    private TimerTask selfPositionTask;
     private boolean running = false;
     private volatile String publishTopicPrefix;
 
@@ -72,6 +100,27 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
                 }
             });
 
+            final MapView startMapView = MapView.getMapView();
+            if (startMapView != null) {
+                outboundMapEventListener = new MapEventDispatcher.MapEventDispatchListener() {
+                    @Override
+                    public void onMapEvent(MapEvent event) {
+                        onOutboundMapEvent(event);
+                    }
+                };
+                MapEventDispatcher dispatcher = startMapView.getMapEventDispatcher();
+                dispatcher.addMapEventListener(MapEvent.ITEM_SHARED, outboundMapEventListener);
+                dispatcher.addMapEventListener(MapEvent.ITEM_PERSIST, outboundMapEventListener);
+            }
+
+            selfPositionTask = new TimerTask() {
+                @Override
+                public void run() {
+                    publishSelfPosition();
+                }
+            };
+            selfPositionTimer.schedule(selfPositionTask, 0, SELF_POSITION_INTERVAL_MS);
+
             running = true;
             Log.i(TAG, "Zenoh bridge started: endpoint=" + settings.getRouterEndpoint()
                     + " subscribe=" + subscribeTopics + " publishPrefix=" + publishTopicPrefix);
@@ -101,6 +150,19 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
                 Log.e(TAG, "Error disconnecting CotServiceRemote", t);
             }
             cotServiceRemote = null;
+        }
+        if (outboundMapEventListener != null) {
+            final MapView mapView = MapView.getMapView();
+            if (mapView != null) {
+                MapEventDispatcher dispatcher = mapView.getMapEventDispatcher();
+                dispatcher.removeMapEventListener(MapEvent.ITEM_SHARED, outboundMapEventListener);
+                dispatcher.removeMapEventListener(MapEvent.ITEM_PERSIST, outboundMapEventListener);
+            }
+            outboundMapEventListener = null;
+        }
+        if (selfPositionTask != null) {
+            selfPositionTask.cancel();
+            selfPositionTask = null;
         }
         bridge.stop();
         publishTopicPrefix = null;
@@ -161,7 +223,11 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         });
     }
 
-    /** Recognizes CoT XML and TAK Protocol (protobuf) CoT; anything else -> null. */
+    /**
+     * Recognizes CoT XML, TAK Protocol (protobuf) CoT, and the
+     * {@code PATCH/tracks/v1} JSON mirror of TAK-protobuf CoT published by
+     * {@code tak-zenoh-bridge}; anything else -> null.
+     */
     private static String decode(byte[] payload) {
         int i = 0;
         while (i < payload.length && isXmlWhitespace(payload[i]))
@@ -170,6 +236,8 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
             return new String(payload, java.nio.charset.StandardCharsets.UTF_8);
         if (TakProtoCotConverter.looksLikeTakProto(payload))
             return TakProtoCotConverter.decode(payload);
+        if (TakJsonCotConverter.looksLikeTakJson(payload))
+            return TakJsonCotConverter.decode(payload);
         return null;
     }
 
@@ -208,13 +276,60 @@ public class CotBridgeService implements CotServiceRemote.CotEventListener {
         return "bytes(" + payload.length + "B) hex[:64]=" + hex;
     }
 
-    /** {@link CotServiceRemote.CotEventListener} -- taps all CoT traffic flowing through ATAK. */
+    /**
+     * {@link CotServiceRemote.CotEventListener} -- catches CoT that passes
+     * through ATAK's *internal* dispatcher. In practice this is mostly this
+     * plugin's own Zenoh-inbound events looping back (filtered out below);
+     * see the class doc for why manual share/broadcast needs the separate
+     * {@link #onOutboundMapEvent} path instead.
+     */
     @Override
     public void onCotEvent(CotEvent event, Bundle extra) {
         if (event == null)
             return;
         if (extra != null && extra.getBoolean(EXTRA_FROM_ZENOH, false))
             return;
+        publishCotEvent(event);
+    }
+
+    /**
+     * {@link MapEventDispatcher.MapEventDispatchListener} callback for
+     * {@link MapEvent#ITEM_SHARED} (always an explicit send) and
+     * {@link MapEvent#ITEM_PERSIST} (only when not marked "internal" --
+     * matches the SDK's {@code commout-simplesocket} sample's filter for
+     * "this persist is actually meant to go out").
+     */
+    private void onOutboundMapEvent(MapEvent event) {
+        MapItem item = event.getItem();
+        if (item == null)
+            return;
+        if (MapEvent.ITEM_PERSIST.equals(event.getType())) {
+            Bundle extras = event.getExtras();
+            if (extras != null && extras.getBoolean("internal"))
+                return;
+        }
+        CotEvent cotEvent = CotEventFactory.createCotEvent(item);
+        if (cotEvent == null)
+            return;
+        publishCotEvent(cotEvent);
+    }
+
+    /** Republishes the self ("ownship") marker on {@link #SELF_POSITION_INTERVAL_MS}. */
+    private void publishSelfPosition() {
+        MapView mapView = MapView.getMapView();
+        if (mapView == null)
+            return;
+        Marker self = mapView.getSelfMarker();
+        if (self == null)
+            return;
+        CotEvent event = CotEventFactory.createCotEvent(self);
+        if (event == null)
+            return;
+        publishCotEvent(event);
+    }
+
+    /** Shared by every outbound path: builds the per-entity key and publishes. */
+    private void publishCotEvent(CotEvent event) {
         String prefix = publishTopicPrefix;
         if (prefix == null || prefix.isEmpty())
             return;

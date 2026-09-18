@@ -307,6 +307,11 @@ dependencies {
     // copied from the SDK's docs/takproto.zip.
     implementation "com.google.protobuf:protobuf-javalite:4.36.2"
     testImplementation "junit:junit:4.13.2"
+    // org.json is part of Android itself at runtime (a real implementation on-device),
+    // but android.jar's copy used for JVM unit tests is a "Stub!"-throwing placeholder --
+    // this test-only jar provides the real reference implementation so
+    // TakJsonCotConverter's parsing can actually be exercised in JVM tests.
+    testImplementation "org.json:json:20240303"
 }
 
 protobuf {
